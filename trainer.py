@@ -8,7 +8,7 @@ from PIL import Image
 import numpy as np
 from typing import Tuple, Dict, List
 import os
-from utils import build_id2posspan_and_caption, create_positive_map_from_span
+from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize
 from glip import GLIPBackbone,GLIPHead,VLDyHead
 
 class COCOGLIPDataset(Dataset):
@@ -31,7 +31,7 @@ class COCOGLIPDataset(Dataset):
         
         # Transform pipeline
         self.transform = T.Compose([
-            T.RandomResize([800], max_size=1333),
+            RandomResize([800], max_size=1333),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -132,9 +132,10 @@ class GLIP(nn.Module):
 
 def train_glip():
 
+    classes=81
     # Model setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = GLIP(hidden_dim=256, num_classes=len(train_dataset.categories))
+    model = GLIP(hidden_dim=256, num_classes=classes)
     model = model.to(device)
 
     # Dataset setup

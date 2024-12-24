@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel, BertTokenizer
+from torchvision.ops import generalized_box_iou_loss
 import timm
 
 class GLIPBackbone(nn.Module):
@@ -17,7 +18,7 @@ class GLIPBackbone(nn.Module):
             swin_type,
             pretrained=True,
             features_only=True,
-            out_indices=(1, 2, 3, 4)  # Get P2-P5 features
+            out_indices=(0,1, 2, 3) # Features 
         )
         
         # Language backbone
@@ -391,27 +392,68 @@ class GLIPHead(nn.Module):
             predictions.append(pred)
             
         return predictions
-        
+
+
+def token_sigmoid_binary_focal_loss(pred_logits, targets, alpha, gamma, text_mask=None):
+    # binary version of focal loss
+    # copied from https://github.com/facebookresearch/fvcore/blob/master/fvcore/nn/focal_loss.py
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+    Returns:
+        Loss tensor with the reduction option applied.
+    """
+    assert (targets.dim() == 3)
+    assert (pred_logits.dim() == 3)  # batch x from x to
+
+    bs, n, _ = pred_logits.shape
+    if text_mask is not None:
+        assert (text_mask.dim() == 2)
+        text_mask = (text_mask > 0).unsqueeze(1)
+        text_mask = text_mask.repeat(1, pred_logits.size(1), 1)  # copy along the image channel dimension
+        pred_logits = torch.masked_select(pred_logits, text_mask)
+        targets = torch.masked_select(targets, text_mask)
+
+        # print(pred_logits.shape)
+        # print(targets.shape)
+
+    p = torch.sigmoid(pred_logits)
+    ce_loss = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    return loss
+
 class TokenSigmoidFocalLoss(nn.Module):
-    def init(self, alpha, gamma):
-        super(TokenSigmoidFocalLoss, self).init()
+
+    def __init__(self, alpha, gamma):
+        super(TokenSigmoidFocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, logits, targets, text_masks=None, version="binary", kwargs):
+    def forward(self, logits, targets, text_masks=None, version="binary", **kwargs):
         if version == "binary":
             loss_func = token_sigmoid_binary_focal_loss
-        elif version == "softmax":
-            loss_func = token_sigmoid_softmax_focal_loss
-        elif version == "binaryv2":
-            loss_func = token_sigmoid_binary_focal_loss_v2
         else:
             raise NotImplementedError
         loss = loss_func(logits, targets, self.alpha, self.gamma, text_masks, kwargs)
         return loss.sum()
 
     def repr(self):
-        tmpstr = self.class.name + "("
+        tmpstr =  "("
         tmpstr += "gamma=" + str(self.gamma)
         tmpstr += ", alpha=" + str(self.alpha)
         tmpstr += ")"
@@ -437,7 +479,6 @@ class GLIPHead(nn.Module):
         self.bias0 = nn.Parameter(torch.Tensor([-2.0]))  # Initial bias for better convergence
 
         # Loss functions
-        self.giou_loss = GIoULoss()
         self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)
         
     def forward(self, features, language_dict_features):
@@ -488,38 +529,40 @@ class GLIPHead(nn.Module):
             
         return predictions
 
-    def loss(self, predictions, targets, text_masks):
+    def loss(self, predictions, targets):
         """Compute detection and grounding losses"""
-        cls_loss = 0
-        reg_loss = 0
-        ctr_loss = 0
-        grounding_loss = 0
+        loss_bbox = 0
+        loss_center = 0
+        loss_grounding = 0
         
         for pred_level, target_level in zip(predictions, targets):
-            # Detection losses
-            reg_loss += self.giou_loss(
+            # GIoU loss - using torchvision's implementation
+            loss_bbox += generalized_box_iou_loss(
                 pred_level['boxes'],
                 target_level['boxes'],
-                weight=pred_level['centers']
+                reduction='mean'
             )
             
-            ctr_loss += F.binary_cross_entropy_with_logits(
+            # Center loss
+            loss_center += F.binary_cross_entropy_with_logits(
                 pred_level['centers'],
-                target_level['centers']
+                target_level['centers'],
+                reduction='mean'
             )
             
             # Grounding loss
-            grounding_loss += self.token_loss(
+            loss_grounding += self.token_loss(
                 pred_level['grounding'],
                 target_level['grounding'],
-                text_masks=text_masks
+                text_masks=target_level.get('text_masks')
             )
             
         return {
-            'loss_bbox': reg_loss,
-            'loss_center': ctr_loss,
-            'loss_grounding': grounding_loss
+            'loss_bbox': loss_bbox,
+            'loss_center': loss_center,
+            'loss_grounding': loss_grounding
         }
+
 
 # Example usage:
 if __name__ == '__main__':
