@@ -8,7 +8,7 @@ from PIL import Image
 import numpy as np
 from typing import Tuple, Dict, List
 import os
-from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize
+from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize,ToTensor,Normalize
 from glip import GLIPBackbone,GLIPHead,VLDyHead
 
 class COCOGLIPDataset(Dataset):
@@ -32,8 +32,8 @@ class COCOGLIPDataset(Dataset):
         # Transform pipeline
         self.transform = T.Compose([
             RandomResize([800], max_size=1333),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ToTensor(),
+            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
     def __len__(self):
@@ -42,7 +42,7 @@ class COCOGLIPDataset(Dataset):
     def load_image(self, image_path: str) -> Tuple[np.array, torch.Tensor]:
         image_source = Image.open(image_path).convert("RGB")
         image = np.asarray(image_source)
-        image_transformed, _ = self.transform(image_source, None)
+        image_transformed, _ = self.transform(image_source)
         return image, image_transformed
 
     def __getitem__(self, idx: int) -> Dict:
