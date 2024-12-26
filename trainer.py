@@ -70,22 +70,25 @@ class COCOGLIPDataset(Dataset):
         str_cls_lst = []
         for ann in annotations:
             x, y, w_box, h_box = ann['bbox']
-            # Convert to center format [cx,cy,w,h]
-            cx = x + w_box/2
-            cy = y + h_box/2
-            boxes.append([cx, cy, w_box, h_box])
+            # Convert to xyxy format
+            x1 = x
+            y1 = y
+            x2 = x + w_box
+            y2 = y + h_box
+            boxes.append([x1, y1, x2, y2])  # xyxy format
             categories.append(ann['category_id'])
             cat_name = self.coco.loadCats([ann['category_id']])[0]['name']
             str_cls_lst.append(cat_name)
         
-        # Create initial target dict
+        # Create target dict in torchvision format
         target = {
-            'boxes': torch.tensor(boxes, dtype=torch.float32),
-            'size': torch.as_tensor([int(h), int(w)]),
+            'boxes': torch.tensor(boxes, dtype=torch.float32),  # xyxy format
             'labels': torch.tensor(categories, dtype=torch.long),
-            'image_id': image_id,
-            'str_cls_lst': str_cls_lst,
-        }
+            'image_id': torch.tensor([image_id]),
+            'area': torch.tensor([ann['area'] for ann in annotations]),
+            'iscrowd': torch.tensor([ann['iscrowd'] for ann in annotations]),
+            # Optional for GLIP
+            'str_cls_lst': str_cls_lst}
         
         # Apply transforms to both image and target
         image_tensor, target = self.transforms(image_source, target)

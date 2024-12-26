@@ -4,13 +4,17 @@ from torchvision.ops import MultiScaleRoIAlign
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from glip import TokenSigmoidFocalLoss
+from torchvision.models.detection.image_list import ImageList
+import torchvision.transforms.functional as F
+
 
 class GLIPHead(nn.Module):
     def __init__(self, hidden_dim=256, num_classes=80):
         super().__init__()
         
         # RPN setup
-        anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
+        anchor_sizes = ((32,), (64,), (128,), (256,))
         aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
         self.anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
         
@@ -31,13 +35,12 @@ class GLIPHead(nn.Module):
         
         # ROI pooling
         self.roi_pooler = MultiScaleRoIAlign(
-            featmap_names=['p2', 'p3', 'p4', 'p5'],  
+            featmap_names=['p2', 'p3', 'p4', 'p5'],
             output_size=7,
             sampling_ratio=2
         )
         
-
-        # ROI heads
+        # Box head and predictor
         self.box_head = TwoMLPHead(hidden_dim * 7 * 7, hidden_dim)
         self.box_predictor = FastRCNNPredictor(hidden_dim, num_classes)
         
@@ -61,53 +64,102 @@ class GLIPHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
+        # Token matching loss
+        self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)
+
     def forward(self, x):
-        # features is a list
-        features = x["visual"]
+        features = x["visual"]  
         language_dict = x["lang"]
         image_sizes = x["original_sizes"]
-
-        features_dict = {str(i): feat for i, feat in enumerate(features)}
-
-        # RPN forward pass
-        proposals, _ = self.rpn(
-            images=None,
-            features=features_dict,
-            targets=None,
-            image_sizes=image_sizes
-        )
-
-        # ROI head forward pass
-        detections = self.roi_heads(
-            features_dict,
-            proposals,
-            image_sizes,
-            None
-        )[0]  # Get detections
+        targets = x.get("targets", None)
         
-        # Add grounding scores for detected boxes
-        if len(detections[0]['boxes']) > 0:
-            det_features = self.roi_pooler(
+        features_dict = {f'p{i+2}': feat for i, feat in enumerate(features)}
+        
+        # Create ImageList
+        batch_size = features[0].shape[0]
+        device = features[0].device
+        dummy_tensor = torch.zeros(
+            batch_size, 3,
+            image_sizes[0][0],
+            image_sizes[0][1],
+            device=device
+        )
+        image_list = ImageList(dummy_tensor, image_sizes)
+        
+        # RPN forward pass
+        proposals, rpn_losses = self.rpn(image_list, features_dict, targets)
+        
+        if self.training and targets is not None:
+            # Get detection losses but zero out classification loss
+            detector_losses = self.roi_heads(
                 features_dict,
-                [d['boxes'] for d in detections]
+                proposals,
+                image_sizes,
+                targets
+            )[1]
+            
+            # Zero out classification loss
+            if 'loss_classifier' in detector_losses:
+                detector_losses['loss_classifier'] = 0.0 * detector_losses['loss_classifier']
+            
+            # Get ROI features for grounding
+            box_features = self.box_head(
+                self.roi_pooler(features_dict, [t["boxes"] for t in targets])
             )
-            det_features = self.box_head(det_features)
-            grounding_features = self.grounding_head(det_features)
+            grounding_features = self.grounding_head(box_features)
             text_features = language_dict['hidden']
             
+            # Compute grounding scores and loss
             grounding_scores = torch.matmul(
                 grounding_features,
                 text_features.transpose(-2, -1)
             )
             
-            # Add grounding scores to detections
-            for det, scores in zip(detections, grounding_scores):
-                det['grounding_scores'] = scores
+            # Compute grounding loss
+            grounding_loss = self.token_loss(
+                grounding_scores,
+                torch.stack([t['positive_map'] for t in targets]),
+                text_masks=language_dict.get('masks')
+            )
+            
+            # Combine all losses
+            losses = {}
+            losses.update(rpn_losses)
+            losses.update(detector_losses)
+            losses['loss_grounding'] = grounding_loss
+            
+            return losses
+            
+        else:
+            # Inference mode
+            detections = self.roi_heads(
+                features_dict,
+                proposals,
+                image_sizes,
+                None
+            )[0]
+            
+            # Add grounding scores
+            if len(detections[0]['boxes']) > 0:
+                det_features = self.roi_pooler(
+                    features_dict,
+                    [d['boxes'] for d in detections]
+                )
+                det_features = self.box_head(det_features)
+                grounding_features = self.grounding_head(det_features)
+                text_features = language_dict['hidden']
                 
-        return detections
-    
+                grounding_scores = torch.matmul(
+                    grounding_features,
+                    text_features.transpose(-2, -1)
+                )
+                
+                for det, scores in zip(detections, grounding_scores):
+                    det['grounding_scores'] = scores
+                    
+            return detections
+        
 
-# Helper classes from torchvision
 class TwoMLPHead(nn.Module):
     def __init__(self, in_channels, hidden_dim):
         super().__init__()
@@ -119,6 +171,7 @@ class TwoMLPHead(nn.Module):
         x = F.relu(self.fc6(x))
         x = F.relu(self.fc7(x))
         return x
+    
 
 class FastRCNNPredictor(nn.Module):
     def __init__(self, in_channels, num_classes):
