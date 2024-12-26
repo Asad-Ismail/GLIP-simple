@@ -6,6 +6,8 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 import torchvision
+from typing import List, Optional
+from torch import Tensor
 
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):
@@ -415,3 +417,257 @@ class Compose(object):
             format_string += "    {0}".format(t)
         format_string += "\n)"
         return format_string
+       
+class NestedTensor(object):
+    def __init__(self, tensors, mask: Optional[Tensor]):
+        self.tensors = tensors
+        self.mask = mask
+        if mask == "auto":
+            self.mask = torch.zeros_like(tensors).to(tensors.device)
+            if self.mask.dim() == 3:
+                self.mask = self.mask.sum(0).to(bool)
+            elif self.mask.dim() == 4:
+                self.mask = self.mask.sum(1).to(bool)
+            else:
+                raise ValueError(
+                    "tensors dim must be 3 or 4 but {}({})".format(
+                        self.tensors.dim(), self.tensors.shape
+                    )
+                )
+
+    def imgsize(self):
+        res = []
+        for i in range(self.tensors.shape[0]):
+            mask = self.mask[i]
+            maxH = (~mask).sum(0).max()
+            maxW = (~mask).sum(1).max()
+            res.append(torch.Tensor([maxH, maxW]))
+        return res
+
+    def to(self, device):
+        # type: (Device) -> NestedTensor # noqa
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            assert mask is not None
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return NestedTensor(cast_tensor, cast_mask)
+
+    def to_img_list_single(self, tensor, mask):
+        assert tensor.dim() == 3, "dim of tensor should be 3 but {}".format(tensor.dim())
+        maxH = (~mask).sum(0).max()
+        maxW = (~mask).sum(1).max()
+        img = tensor[:, :maxH, :maxW]
+        return img
+
+    def to_img_list(self):
+        """remove the padding and convert to img list
+
+        Returns:
+            [type]: [description]
+        """
+        if self.tensors.dim() == 3:
+            return self.to_img_list_single(self.tensors, self.mask)
+        else:
+            res = []
+            for i in range(self.tensors.shape[0]):
+                tensor_i = self.tensors[i]
+                mask_i = self.mask[i]
+                res.append(self.to_img_list_single(tensor_i, mask_i))
+            return res
+
+    @property
+    def device(self):
+        return self.tensors.device
+
+    def decompose(self):
+        return self.tensors, self.mask
+
+    def __repr__(self):
+        return str(self.tensors)
+
+    @property
+    def shape(self):
+        return {"tensors.shape": self.tensors.shape, "mask.shape": self.mask.shape}
+    
+
+@torch.jit.unused
+def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTensor:
+    max_size = []
+    for i in range(tensor_list[0].dim()):
+        max_size_i = torch.max(
+            torch.stack([img.shape[i] for img in tensor_list]).to(torch.float32)
+        ).to(torch.int64)
+        max_size.append(max_size_i)
+    max_size = tuple(max_size)
+
+    # work around for
+    # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+    # m[: img.shape[1], :img.shape[2]] = False
+    # which is not yet supported in onnx
+    padded_imgs = []
+    padded_masks = []
+    for img in tensor_list:
+        padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+        padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
+        padded_imgs.append(padded_img)
+
+        m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
+        padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
+        padded_masks.append(padded_mask.to(torch.bool))
+
+    tensor = torch.stack(padded_imgs)
+    mask = torch.stack(padded_masks)
+
+    return NestedTensor(tensor, mask=mask)
+
+ 
+def _max_by_axis(the_list):
+    # type: (List[List[int]]) -> List[int]
+    maxes = the_list[0]
+    for sublist in the_list[1:]:
+        for index, item in enumerate(sublist):
+            maxes[index] = max(maxes[index], item)
+    return maxes       
+
+def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+    # TODO make this more general
+    if tensor_list[0].ndim == 3:
+        if torchvision._is_tracing():
+            # nested_tensor_from_tensor_list() does not export well to ONNX
+            # call _onnx_nested_tensor_from_tensor_list() instead
+            return _onnx_nested_tensor_from_tensor_list(tensor_list)
+
+        # TODO make it support different-sized images
+        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+        # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
+        batch_shape = [len(tensor_list)] + max_size
+        b, c, h, w = batch_shape
+        dtype = tensor_list[0].dtype
+        device = tensor_list[0].device
+        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+        for img, pad_img, m in zip(tensor_list, tensor, mask):
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            m[: img.shape[1], : img.shape[2]] = False
+    else:
+        raise ValueError("not supported")
+    return NestedTensor(tensor, mask)       
+        
+
+def convert_od_to_grounding_data(target, tokenizer, ind_to_class, max_query_len=256, 
+                              num_negatives=2, add_task_prompt=True):
+    """
+    Convert single object detection target to grounding format using GLIP-style prompts.
+    
+    Args:
+        target: Single target with boxes and labels
+        tokenizer: BERT tokenizer
+        ind_to_class: Class index to name mapping
+        max_query_len: Maximum query length
+        num_negatives: Number of negative classes to sample
+        add_task_prompt: Whether to add "object detection:" prompt
+    """
+    # Get positive classes (present in image)
+    pos_classes = set(target['labels'].cpu().numpy().tolist())
+    
+    # Sample negative classes (not present in image) 
+    available_negs = [i for i in ind_to_class.keys() 
+                     if i not in pos_classes and i != 0]  # exclude background
+    if num_negatives > 0:
+        neg_classes = random.sample(available_negs, 
+                                 min(num_negatives, len(available_negs)))
+    else:
+        neg_classes = []
+        
+    # Build caption with both positive and negative classes
+    classes = sorted(list(pos_classes)) + neg_classes
+    
+    # Start caption according to prompt style
+    caption = "object detection: " if add_task_prompt else ""
+    
+    # Track text span positions for each class
+    label_to_positions = {}
+    
+    # Build BERT-friendly caption with period separators
+    for i, class_id in enumerate(classes):
+        start_pos = len(caption)
+        class_name = ind_to_class[class_id].strip()
+        caption += class_name
+        end_pos = len(caption)
+        
+        label_to_positions[class_id] = [start_pos, end_pos]
+        
+        # Add period separator instead of space (better for BERT)
+        if i < len(classes) - 1:
+            caption += ". "
+            
+    caption += "."
+    
+    # Tokenize caption
+    tokenized = tokenizer(
+        caption,
+        return_tensors="pt",
+        max_length=max_query_len,
+        truncation=True,
+        padding='max_length'
+    )
+    
+    # Create positive map tensor
+    num_boxes = len(target['boxes'])
+    positive_map = torch.zeros((num_boxes, max_query_len), dtype=torch.float)
+    
+    # Map each box to its class text span
+    for box_idx in range(num_boxes):
+        class_id = target['labels'][box_idx].item()
+        if class_id in label_to_positions:
+            char_start, char_end = label_to_positions[class_id]
+            
+            # Convert char positions to token positions
+            token_start = tokenized[0].char_to_token(char_start) 
+            token_end = tokenized[0].char_to_token(char_end - 1)
+            
+            if token_start is not None and token_end is not None:
+                positive_map[box_idx, token_start:token_end + 1] = 1.0
+    
+    # Normalize positive map
+    normalizer = positive_map.sum(-1)[:, None] + 1e-6
+    positive_map = positive_map / normalizer
+    
+    # Update target with grounding information
+    target.update({
+        'positive_map': positive_map,
+        'caption': caption,
+        'attention_mask': tokenized.attention_mask[0]
+    })
+    
+    return target
+
+def prepare_batch(batch, device):
+    """
+    Prepare batch for training by moving tensors to device and handling nested tensors.
+    Returns images, targets, original_sizes, and captions separately.
+    """
+    images, target_lists = batch  # Now each item in batch is (image, [target])
+    
+    # Flatten list of lists of targets
+    targets = [t[0] for t in target_lists]  # Get first (and only) target from each list
+    
+    # Extract captions and sizes
+    captions = [t['caption'] for t in targets]
+    original_sizes = [t['size'] for t in targets]
+    
+    # Convert list of images to NestedTensor 
+    if isinstance(images, (list, tuple)):
+        images = nested_tensor_from_tensor_list(images)
+    images = images.to(device)
+    
+    # Move target tensors to device
+    for target in targets:
+        for k, v in target.items():
+            if isinstance(v, torch.Tensor):
+                target[k] = v.to(device)
+    
+    return images, targets, original_sizes, captions

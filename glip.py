@@ -1,52 +1,93 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertModel, BertTokenizer
+from transformers import BertModel, BertTokenizer,BertTokenizerFast
 from torchvision.ops import generalized_box_iou_loss
 import timm
+from typing import OrderedDict
+from torchvision.models import swin_b
+import math
+
 
 class GLIPBackbone(nn.Module):
-    """Backbone with Swin from timm and BERT"""
     def __init__(self, 
-                 swin_type='swin_base_patch4_window7_224',  # or swin_large
                  bert_type="bert-base-uncased",
                  max_query_len=256):
         super().__init__()
         
-        # Visual backbone from timm
-        self.swin = timm.create_model(
-            swin_type,
-            pretrained=True,
-            features_only=True,
-            out_indices=(0,1, 2, 3) # Features 
-        )
+        # Get Swin-B model without classification head
+        swin = swin_b(weights='DEFAULT')
+        self.features = swin.features  
         
+        channels = {
+            'p1': 128,   
+            'p2': 256,   
+            'p3': 512,   
+            'p4': 1024   
+        }
+
+        # Feature projection to common dimension (256)
+        self.feature_proj = nn.ModuleDict({
+            level: nn.Conv2d(dim, 256, 1) 
+            for level, dim in channels.items()
+        })
+
         # Language backbone
-        self.tokenizer = BertTokenizer.from_pretrained(bert_type)
+        self.tokenizer = BertTokenizerFast.from_pretrained(bert_type)
         self.bert = BertModel.from_pretrained(bert_type)
         self.max_query_len = max_query_len
 
-    def get_visual_features(self, images, original_sizes):
-        """Get feature pyramid from Swin"""
-        # Get hierarchical features
-        features = self.swin(images)
-        
-        # Create P6 by pooling P5
-        p6 = F.max_pool2d(features[-1], kernel_size=2, stride=2)
-        
-        # Return ordered dict of features
-        feature_dict = {
-            'p2': features[0],  # 1/4
-            'p3': features[1],  # 1/8
-            'p4': features[2],  # 1/16
-            'p5': features[3],  # 1/32
-            'p6': p6           # 1/64
-        }
+    def get_visual_features(self, images):
+        """Get proper FPN features (P2-P6) from Swin backbone"""
+        tensors, mask = images.decompose()
+        valid_mask = ~mask
 
-        return {
-            'features': feature_dict,
-            'original_sizes': original_sizes
-        }
+        input_h, input_w = tensors.shape[2:]
+        print(f"\nInput size: {input_h}x{input_w}")
+        
+        features = {}
+        feature_masks = {}
+        
+        x = tensors
+        
+        # Process through features layer by layer
+        for i, layer in enumerate(self.features):
+            x = layer(x)
+            
+            # Take features from the second layer of each stage
+            if i in [1, 3, 5, 7]:  
+                level = f'p{(i//2)+1}' 
+                
+                # Convert from [B, H, W, C] to [B, C, H, W]
+                feat = x.permute(0, 3, 1, 2).contiguous()
+                
+                # Project to common dimension
+                feat = self.feature_proj[level](feat)
+
+                curr_h, curr_w = feat.shape[2:]
+                actual_stride_h = input_h // curr_h
+                actual_stride_w = input_w // curr_w
+                print(f"\n{level} output size: {curr_h}x{curr_w}")
+                print(f"{level} stride: {actual_stride_h}x{actual_stride_w} " )
+                
+                # Get mask for this level
+                feat_mask = F.interpolate(valid_mask[None].float(), 
+                                        size=feat.shape[-2:],
+                                        mode='nearest').bool()[0]
+                
+                # Store features and mask
+                features[level] = feat * feat_mask.unsqueeze(1).float()
+                feature_masks[level] = feat_mask
+        
+        # Add P5
+        #p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
+        #p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
+        #                      size=p5.shape[-2:],
+        #                      mode='nearest')[0].bool()
+        #features['p5'] = p5 * p5_mask.unsqueeze(1).float()
+        #feature_masks['p5'] = p5_mask
+        
+        return features, feature_masks
 
     def get_text_features(self, captions, device):
         """Process text through BERT"""
@@ -73,15 +114,27 @@ class GLIPBackbone(nn.Module):
         }
 
     def forward(self, images, original_sizes, captions):
-        device = images.device
-        visual_feats = self.get_visual_features(images, original_sizes)
+        """
+        Args:
+            images: NestedTensor with tensors and mask
+            original_sizes: original image sizes before preprocessing
+            captions: list of text queries
+        """
+        device = images.tensors.device
+        
+        # 1. Get visual features and their masks
+        visual_feats, visual_masks = self.get_visual_features(images)
+        
+        # 2. Process text features
         text_feats = self.get_text_features(captions, device)
         
+        # 3. Create output dict with proper structure
         return {
             'visual': visual_feats,
-            'language': text_feats
+            'visual_masks': visual_masks,  # Add masks for attention
+            'language': text_feats,
+            'original_sizes': original_sizes
         }
-
 
 class VLDyHead(nn.Module):
     def __init__(self, num_convs=8, hidden_dim=256, in_channels=256):
@@ -97,7 +150,7 @@ class VLDyHead(nn.Module):
             dyhead_tower.append(VLFuse(hidden_dim=hidden_dim))
             
             # 2. Add language self-attention layer
-            dyhead_tower.append(BertEncoderLayer(hidden_dim))
+            dyhead_tower.append(BertEncoderLayer())
 
             # 3. Add vision path (DyConv)
             curr_in_channels = in_channels if i == 0 else channels
@@ -109,6 +162,11 @@ class VLDyHead(nn.Module):
             )
         
         self.dyhead_tower = nn.Sequential(*dyhead_tower)
+        # Final projection for language features from 768 to 256
+        self.final_lang_proj = nn.Sequential(
+            nn.Linear(768, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
         
     def forward(self, features):
         """
@@ -117,88 +175,93 @@ class VLDyHead(nn.Module):
                 - visual: List[Tensor] of FPN features
                 - lang: dict with 'hidden' and 'masks' 
         """
-        return self.dyhead_tower(features)
-
+        x=self.dyhead_tower(features)
+        x["lang"]["hidden"] = self.final_lang_proj(x["lang"]["hidden"])
+        return x
 
 class BiMultiHeadAttention(nn.Module):
-    """Official GLIP bi-directional attention implementation"""
-    def __init__(self, v_dim=256, l_dim=768, embed_dim=256, num_heads=8, dropout=0.1):
+    def __init__(self, v_dim=256, l_dim=768, embed_dim=2048, num_heads=8, dropout=0.1):
         super().__init__()
-        
-        self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** (-0.5)
+        self.scaling = self.head_dim ** -0.5
         
-        # Projections
+        # Project to common dimension with correct scaling
         self.v_proj = nn.Linear(v_dim, embed_dim)
         self.l_proj = nn.Linear(l_dim, embed_dim)
         self.values_v_proj = nn.Linear(v_dim, embed_dim)
         self.values_l_proj = nn.Linear(l_dim, embed_dim)
+        
+        # Project back
         self.out_v_proj = nn.Linear(embed_dim, v_dim)
         self.out_l_proj = nn.Linear(embed_dim, l_dim)
         
-        self.dropout = nn.Dropout(dropout)
+        # Initialize projections with small weights for stability
+        self._reset_parameters()
         
-    def _shape(self, tensor, seq_len, bsz):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+    def _reset_parameters(self):
+        for proj in [self.v_proj, self.l_proj, self.values_v_proj, self.values_l_proj]:
+            fan_out = proj.weight.size(0)
+            std = (2.0 / fan_out) ** 0.5
+            nn.init.normal_(proj.weight, mean=0, std=std)
+            nn.init.zeros_(proj.bias)
+            
+    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
+        B, Hv, _ = v.shape
+        _, Hl, _ = l.shape
         
-    def forward(self, v, l, attention_mask_l=None):
-        bsz, tgt_len, _ = v.size()
-        src_len = l.size(1)
+        # 1. Project to common dimension with scaling
+        q = self.v_proj(v) * self.scaling 
+        k = self.l_proj(l)
+        v_value = self.values_v_proj(v)
+        l_value = self.values_l_proj(l)
         
-        # Project and reshape
-        query_states = self.v_proj(v) * self.scale
-        key_states = self._shape(self.l_proj(l), -1, bsz)
-        value_v_states = self._shape(self.values_v_proj(v), -1, bsz)
-        value_l_states = self._shape(self.values_l_proj(l), -1, bsz)
+        # 2. Reshape
+        q = q.view(B, Hv, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, Hl, self.num_heads, self.head_dim).transpose(1, 2)
+        v_value = v_value.view(B, Hv, self.num_heads, self.head_dim).transpose(1, 2)
+        l_value = l_value.view(B, Hl, self.num_heads, self.head_dim).transpose(1, 2)
         
-        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
-        key_states = key_states.view(*proj_shape)
-        value_v_states = value_v_states.view(*proj_shape)
-        value_l_states = value_l_states.view(*proj_shape)
+        # 3. Attention with mask handling
+        attn = torch.matmul(q, k.transpose(-2, -1))
         
-        # Compute attention
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
-        
+        # Apply language mask (B, L) -> (B, 1, 1, L)
         if attention_mask_l is not None:
-            attention_mask = attention_mask_l.unsqueeze(1).unsqueeze(1)
-            attention_mask = attention_mask.expand(bsz, 1, tgt_len, src_len)
-            attention_mask = attention_mask.masked_fill(attention_mask == 0, -9e15)
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            attn_mask_l = attention_mask_l.bool()
+            attn_mask_l = attn_mask_l.unsqueeze(1).unsqueeze(1)
+            attn_mask_l = attn_mask_l.expand(B, self.num_heads, Hv, -1)
+            attn = attn.masked_fill(~attn_mask_l, -1e4)
         
-        # Bi-directional attention
-        attn_weights_v = F.softmax(attn_weights, dim=-1)
-        attn_weights_l = F.softmax(attn_weights.transpose(1, 2), dim=-1)
+        # Apply vision mask (B, H, W) -> (B, 1, HW, 1)
+        if attention_mask_v is not None:
+            attn_mask_v = attention_mask_v.bool()
+            attn_mask_v = attn_mask_v.view(B, 1, Hv, 1)
+            attn_mask_v = attn_mask_v.expand(B, self.num_heads, -1, Hl)
+            attn = attn.masked_fill(~attn_mask_v, -1e4)
+            
+        # 4. Normalized attention scores
+        attn_v = F.softmax(attn, dim=-1)
+        attn_l = F.softmax(attn.transpose(-2, -1), dim=-1)
         
-        # Apply attention
-        attn_output_v = torch.bmm(self.dropout(attn_weights_v), value_l_states)
-        attn_output_l = torch.bmm(self.dropout(attn_weights_l), value_v_states)
+        # 5. Compute outputs
+        out_v = torch.matmul(attn_v, l_value)
+        out_l = torch.matmul(attn_l, v_value)
         
-        # Reshape back
-        attn_output_v = attn_output_v.view(bsz, self.num_heads, tgt_len, self.head_dim)
-        attn_output_l = attn_output_l.view(bsz, self.num_heads, src_len, self.head_dim)
+        # 6. Reshape and project back
+        out_v = out_v.transpose(1, 2).reshape(B, Hv, -1)
+        out_l = out_l.transpose(1, 2).reshape(B, Hl, -1)
         
-        attn_output_v = attn_output_v.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
-        attn_output_l = attn_output_l.transpose(1, 2).reshape(bsz, src_len, self.embed_dim)
-        
-        # Final projections
-        attn_output_v = self.out_v_proj(attn_output_v)
-        attn_output_l = self.out_l_proj(attn_output_l)
-        
-        return attn_output_v, attn_output_l
+        return self.out_v_proj(out_v), self.out_l_proj(out_l)
 
 class BiAttentionBlock(nn.Module):
-    def __init__(self, v_dim=256, l_dim=768, embed_dim=256, num_heads=8, dropout=0.1, init_values=1e-4):
+    def __init__(self, v_dim=256, l_dim=768, embed_dim=2048, num_heads=8, dropout=0.1, init_values=1e-4):
         super().__init__()
         
-        # Pre-norm
+        # Layer norms 
         self.layer_norm_v = nn.LayerNorm(v_dim)
         self.layer_norm_l = nn.LayerNorm(l_dim)
         
-        # Attention
+        # Cross attention with proper scaling
         self.attn = BiMultiHeadAttention(
             v_dim=v_dim,
             l_dim=l_dim,
@@ -207,90 +270,216 @@ class BiAttentionBlock(nn.Module):
             dropout=dropout
         )
         
-        # Layer scale parameters
-        self.gamma_v = nn.Parameter(init_values * torch.ones(v_dim))
-        self.gamma_l = nn.Parameter(init_values * torch.ones(l_dim))
-        
-    def forward(self, visual_feats, lang_feats, lang_masks):
-        # Process each visual level with language
+        # Layer scale init 
+        self.gamma_v = nn.Parameter(torch.ones(v_dim) * 0.125)
+        self.gamma_l = nn.Parameter(torch.ones(l_dim) * 0.125)
+    
+    def forward(self, visual_feats, visual_masks, lang_feats, lang_masks):
         fused_visual = []
         
-        for feat in visual_feats:
-            bs, _, h, w = feat.shape
-            v = feat.flatten(2).transpose(1, 2)  # [B, HW, C]
+        for feat, feat_mask in zip(visual_feats, visual_masks):
+            # 1. Prepare visual features
+            bs, c, h, w = feat.shape
+            v = feat.flatten(2).transpose(1, 2)  # [B, HW, 256]
+            v_mask = feat_mask.flatten(1)  # [B, HW]
             
-            # Pre-norm
+            # 2. Pre-norm
             v = self.layer_norm_v(v)
             l = self.layer_norm_l(lang_feats)
             
-            # Bi-attention
-            delta_v, delta_l = self.attn(v, l, attention_mask_l=lang_masks)
+            # 3. Cross attention with masks
+            delta_v, delta_l = self.attn(v, l, 
+                                       attention_mask_v=v_mask,
+                                       attention_mask_l=lang_masks)
             
-            # Residual
+            # 4. Layer scale and residual
             v = v + self.gamma_v * delta_v
-            l = l + self.gamma_l * delta_l
+            l = lang_feats + self.gamma_l * delta_l
             
-            # Reshape back
-            v = v.transpose(1, 2).reshape(bs, -1, h, w)
+            # 5. Reshape visual and maintain mask
+            v = v.transpose(1, 2).reshape(bs, c, h, w)
             fused_visual.append(v)
             
         return fused_visual, l
 
-
 class VLFuse(nn.Module):
-    """Cross-modality fusion module"""
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim=256):
         super().__init__()
-        self.bi_attn = BiAttentionBlock(hidden_dim)
-        
+        self.bi_attn = BiAttentionBlock(
+            v_dim=hidden_dim,
+            l_dim=768,
+            embed_dim=2048,
+            num_heads=8,
+            dropout=0.1,
+            init_values=1e-4
+        )
+    
     def forward(self, x):
         visual_feats = x["visual"]
+        visual_masks = x["visual_masks"]
         lang_dict = x["lang"]
-        
+
+        # Do cross-modal fusion with masks
         fused_visual, fused_lang = self.bi_attn(
             visual_feats,
+            visual_masks,
             lang_dict["hidden"],
             lang_dict["masks"]
         )
         
         return {
             "visual": fused_visual,
+            "visual_masks": visual_masks,  # Pass through masks
             "lang": {
                 "hidden": fused_lang,
                 "masks": lang_dict["masks"]
             }
         }
 
-class BertEncoderLayer(nn.Module):
-    """Language self-attention layer"""
-    def __init__(self, hidden_dim):
+
+class BertAttention(nn.Module):
+    def __init__(self, hidden_size=768, num_heads=12, dropout=0.1):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(hidden_dim, 8)
-        self.norm = nn.LayerNorm(hidden_dim)
+        assert hidden_size % num_heads == 0
         
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scaling = self.head_dim ** -0.5
+        
+        # Pre-norm and projections
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize with small weights
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        for proj in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+            nn.init.xavier_uniform_(proj.weight, gain=0.1)
+            nn.init.zeros_(proj.bias)
+            
+    def forward(self, x, mask=None):
+        bsz, seq_len, _ = x.shape
+        
+        # Check input for NaN
+        #if torch.isnan(x).any():
+        #    print("NaN in attention input")
+        #    return x
+            
+        x = self.norm(x)
+        
+        # Project to Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Reshape heads
+        def reshape_for_attention(x):
+            return x.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            
+        q = reshape_for_attention(q)
+        k = reshape_for_attention(k)
+        v = reshape_for_attention(v)
+        
+        # Compute scaled attention scores
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        
+        # Apply attention mask
+        if mask is not None:
+            attn_weights = attn_weights + mask
+            
+        # Stable softmax with clipping
+        attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+        
+        context = torch.matmul(attn_probs, v)
+        
+        # Reshape back
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(bsz, seq_len, self.hidden_size)
+        
+        # Final projection
+        output = self.out_proj(context)
+        output = self.dropout(output)
+
+        return output
+    
+
+class BertEncoderLayer(nn.Module):
+    def __init__(self, hidden_size=768, mlp_ratio=4, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # Pre-norms (more stable than post-norm)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+        
+        # Attention
+        self.attn = BertAttention(hidden_size, dropout=dropout)
+        
+        # FFN with smaller initial weights
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),  # Extra dropout for stability
+            nn.Linear(hidden_size * mlp_ratio, hidden_size),
+            nn.Dropout(dropout)
+        )
+        
+        # Scaled residual connections
+        self.gamma1 = nn.Parameter(torch.ones(hidden_size) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(hidden_size) * 0.1)
+        
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        # Initialize with smaller weights
+        for m in self.ffn.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
     def forward(self, x):
         visual_feats = x["visual"]
+        visual_masks = x["visual_masks"]  # Get masks
         lang_dict = x["lang"]
         
-        # Language self-attention
-        lang_feats = lang_dict["hidden"]
-        lang_masks = lang_dict["masks"]
+        # Get inputs
+        hidden = lang_dict["hidden"]
+
+        #if torch.isnan(hidden).any():
+        #    print("NaN in attention input")
+        #    return x
+
+        mask = None
+        if "masks" in lang_dict:
+            # Stable mask creation
+            mask = lang_dict["masks"].float()
+            mask = (1.0 - mask)[:, None, None, :] 
+            mask = mask.masked_fill(mask.bool(), -1e4)  # Use smaller value than inf
         
-        new_lang = self.self_attn(
-            lang_feats, 
-            lang_feats,
-            lang_feats,
-            key_padding_mask=~lang_masks
-        )[0]
-        new_lang = self.norm(new_lang + lang_feats)  # Add residual
+        # Pre-norm + scaled residual for attention
+        normed = self.norm1(hidden)
+        hidden = hidden + self.gamma1.unsqueeze(0).unsqueeze(0) * self.attn(normed, mask)
+        
+        # Pre-norm + scaled residual for FFN
+        normed = self.norm2(hidden)
+        hidden = hidden + self.gamma2.unsqueeze(0).unsqueeze(0) * self.ffn(normed)
         
         return {
-            "visual": visual_feats,  # Pass through
-            "lang": {
-                "hidden": new_lang,
-                "masks": lang_masks
-            }
+            "visual": visual_feats,
+            "visual_masks": visual_masks,  # Pass through masks
+            "lang": {"hidden": hidden, "masks": lang_dict["masks"]}
         }
+        
 
 class DyConv(nn.Module):
     """Vision path with dynamic convolution"""
@@ -302,6 +491,7 @@ class DyConv(nn.Module):
         
     def forward(self, x):
         visual_feats = x["visual"]
+        visual_masks = x["visual_masks"]  
         lang_dict = x["lang"]
         
         # Process each FPN level
@@ -312,87 +502,18 @@ class DyConv(nn.Module):
             
         return {
             "visual": processed,
-            "lang": lang_dict  # Pass through
+            "visual_masks": visual_masks,  # Pass through masks
+            "lang": lang_dict              # Pass through
         }
 
-
-class GLIPHead(nn.Module):
-    """GLIP detection and grounding head using ATSS/FCOS style detection"""
-    def __init__(self, hidden_dim=256, num_classes=80, strides=[8, 16, 32, 64, 128]):
+class Scale(nn.Module):
+    def __init__(self, init_value=1.0):
         super().__init__()
-        self.strides = strides  # FPN strides
+        self.scale = nn.Parameter(torch.tensor([init_value], dtype=torch.float32))
         
-        # Shared head convs
-        self.head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.GroupNorm(32, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.GroupNorm(32, hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Detection heads
-        self.bbox_head = nn.Conv2d(hidden_dim, 4, 3, padding=1)  # Box regression (t,l,b,r)
-        self.center_head = nn.Conv2d(hidden_dim, 1, 3, padding=1)  # Centerness
-        
-        # Grounding heads
-        self.dot_product_projection_image = nn.Identity()
-        self.dot_product_projection_text = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Scale factors for each FPN level
-        self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in strides])
-
-    def forward_single_level(self, x, stride_idx, text_embeds):
-        """Forward pass for single FPN level"""
-        features = self.head(x)
-        B, C, H, W = features.shape
-        
-        # Get centers for each location
-        shifts_x = torch.arange(0, W * stride, step=stride, dtype=torch.float32, device=x.device)
-        shifts_y = torch.arange(0, H * stride, step=stride, dtype=torch.float32, device=x.device)
-        shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
-        locations = torch.stack([shift_x, shift_y], dim=0)  # [2, H, W]
-        
-        # Box regression relative to center locations
-        pred_boxes = self.scales[stride_idx](self.bbox_head(features))  # [B, 4, H, W]
-        pred_centers = self.center_head(features)  # [B, 1, H, W]
-        
-        # Grounding predictions
-        img_embeds = self.dot_product_projection_image(features)
-        img_embeds = img_embeds.view(B, C, -1).permute(0, 2, 1)  # [B, HW, C]
-        img_embeds = F.normalize(img_embeds, p=2, dim=-1)
-        
-        # Compute grounding scores
-        text_embeds = F.normalize(text_embeds, p=2, dim=-1)
-        grounding_scores = torch.matmul(img_embeds, text_embeds.transpose(-1, -2))
-        
-        return {
-            'boxes': pred_boxes,
-            'centers': pred_centers,
-            'grounding': grounding_scores,
-            'locations': locations
-        }
-
-    def forward(self, features, language_dict_features):
-        """
-        Args:
-            features: List[Tensor] of FPN features P2-P6
-            language_dict_features: Dict with text embeddings and masks
-        """
-        text_embeds = language_dict_features['hidden']
-        predictions = []
-        
-        for level_idx, (feature, stride) in enumerate(zip(features, self.strides)):
-            pred = self.forward_single_level(
-                feature, 
-                level_idx,
-                text_embeds
-            )
-            predictions.append(pred)
-            
-        return predictions
-
+    def forward(self, x):
+        return x * self.scale
+    
 
 def token_sigmoid_binary_focal_loss(pred_logits, targets, alpha, gamma, text_mask=None):
     # binary version of focal loss
@@ -529,39 +650,42 @@ class GLIPHead(nn.Module):
             
         return predictions
 
-    def loss(self, predictions, targets):
-        """Compute detection and grounding losses"""
-        loss_bbox = 0
-        loss_center = 0
-        loss_grounding = 0
+
+def compute_losses(predictions, targets, text_masks=None):
+    """Compute GLIP losses outside model forward pass"""
+    loss_bbox = 0
+    loss_centerness = 0 
+    loss_grounding = 0
+    
+    for pred_level, target_level in zip(predictions, targets):
+        # Box regression loss using GIoU
+        loss_bbox += generalized_box_iou_loss(
+            pred_level['boxes'],
+            target_level['boxes'],
+            reduction='mean'
+        )
         
-        for pred_level, target_level in zip(predictions, targets):
-            # GIoU loss - using torchvision's implementation
-            loss_bbox += generalized_box_iou_loss(
-                pred_level['boxes'],
-                target_level['boxes'],
-                reduction='mean'
-            )
-            
-            # Center loss
-            loss_center += F.binary_cross_entropy_with_logits(
-                pred_level['centers'],
-                target_level['centers'],
-                reduction='mean'
-            )
-            
-            # Grounding loss
-            loss_grounding += self.token_loss(
-                pred_level['grounding'],
-                target_level['grounding'],
-                text_masks=target_level.get('text_masks')
-            )
-            
-        return {
-            'loss_bbox': loss_bbox,
-            'loss_center': loss_center,
-            'loss_grounding': loss_grounding
-        }
+        # Centerness loss
+        loss_centerness += F.binary_cross_entropy_with_logits(
+            pred_level['centers'],
+            target_level['centers'],
+            reduction='mean'
+        )
+        
+        # Grounding loss using token focal loss
+        loss_grounding += token_sigmoid_binary_focal_loss(
+            pred_level['grounding'],
+            target_level['positive_map'],
+            alpha=0.25,
+            gamma=2.0,
+            text_mask=text_masks
+        )
+    
+    return {
+        'loss_bbox': loss_bbox,
+        'loss_centerness': loss_centerness,
+        'loss_grounding': loss_grounding
+    }
 
 
 # Example usage:

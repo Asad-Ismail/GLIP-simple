@@ -7,51 +7,58 @@ import torchvision.transforms as T
 from PIL import Image
 import numpy as np
 from typing import Tuple, Dict, List
+from transformers import BertTokenizer
 import os
-from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize,ToTensor,Normalize
-from glip import GLIPBackbone,GLIPHead,VLDyHead
+from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize,ToTensor,Normalize,Compose,build_captions_and_token_span
+from utils import nested_tensor_from_tensor_list,prepare_batch,convert_od_to_grounding_data
+from glip import GLIPBackbone,VLDyHead,compute_losses
+from head import GLIPHead
 
 class COCOGLIPDataset(Dataset):
     def __init__(self, 
                  coco_path: str,
                  image_dir: str,
-                 split: str = 'train2017',
-                 max_text_len: int = 256):
+                 tokenizer,
+                 transforms=None,
+                 num_negatives=2,
+                 max_query_len=256,
+                 add_task_prompt=False):
         super().__init__()
         self.coco = COCO(coco_path)
         self.image_dir = image_dir
-        self.max_text_len = max_text_len
+        self.tokenizer = tokenizer
+        self.max_query_len = max_query_len
+        self.num_negatives = num_negatives
+        self.add_task_prompt = add_task_prompt
         
-        # Get category information
+        # Get category information and mapping
         self.categories = self.coco.loadCats(self.coco.getCatIds())
-        self.id2posspan, self.caption = build_id2posspan_and_caption(self.categories)
+        self.ind_to_class = {cat['id']: cat['name'] for cat in self.categories}
         
         # Get image ids
         self.image_ids = list(self.coco.imgs.keys())
         
         # Transform pipeline
-        self.transform = T.Compose([
-            RandomResize([800], max_size=1333),
-            ToTensor(),
-            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+        if transforms is None:
+            self.transforms = Compose([
+                RandomResize([800], max_size=400),
+                ToTensor(),
+                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transforms = transforms
 
-    def __len__(self):
-        return len(self.image_ids)
-    
-    def load_image(self, image_path: str) -> Tuple[np.array, torch.Tensor]:
-        image_source = Image.open(image_path).convert("RGB")
-        image = np.asarray(image_source)
-        image_transformed, _ = self.transform(image_source)
-        return image, image_transformed
 
-    def __getitem__(self, idx: int) -> Dict:
+
+    def __getitem__(self, idx: int):
         image_id = self.image_ids[idx]
         
         # Load image
         img_info = self.coco.imgs[image_id]
         image_path = os.path.join(self.image_dir, img_info['file_name'])
-        image, image_tensor = self.load_image(image_path)
+        image_source = Image.open(image_path).convert("RGB")
+        image = np.asarray(image_source)
+        h, w = image.shape[0:2]
         
         # Get annotations
         ann_ids = self.coco.getAnnIds(imgIds=image_id)
@@ -60,75 +67,106 @@ class COCOGLIPDataset(Dataset):
         # Process boxes and categories
         boxes = []
         categories = []
+        str_cls_lst = []
         for ann in annotations:
-            x, y, w, h = ann['bbox']
-            boxes.append([x, y, x + w, y + h])
+            x, y, w_box, h_box = ann['bbox']
+            # Convert to center format [cx,cy,w,h]
+            cx = x + w_box/2
+            cy = y + h_box/2
+            boxes.append([cx, cy, w_box, h_box])
             categories.append(ann['category_id'])
+            cat_name = self.coco.loadCats([ann['category_id']])[0]['name']
+            str_cls_lst.append(cat_name)
         
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        categories = torch.tensor(categories, dtype=torch.long)
-        
-        # Create positive map for text-box associations
-        token_span = [self.id2posspan[cat_id] for cat_id in categories.tolist()]
-        tokenized = self.tokenizer(self.caption, return_offsets_mapping=True)
-        positive_map = create_positive_map_from_span(
-            tokenized,
-            token_span,
-            max_text_len=self.max_text_len
-        )
-        
-        return {
-            'image': image_tensor,
-            'boxes': boxes,
-            'categories': categories,
-            'caption': self.caption,
-            'positive_map': positive_map,
+        # Create initial target dict
+        target = {
+            'boxes': torch.tensor(boxes, dtype=torch.float32),
+            'size': torch.as_tensor([int(h), int(w)]),
+            'labels': torch.tensor(categories, dtype=torch.long),
             'image_id': image_id,
-            'original_size': (img_info['height'], img_info['width'])
+            'str_cls_lst': str_cls_lst,
         }
+        
+        # Apply transforms to both image and target
+        image_tensor, target = self.transforms(image_source, target)
+        
+        target = convert_od_to_grounding_data(
+            target,
+            self.tokenizer,
+            self.ind_to_class,
+            self.max_query_len,
+            self.num_negatives,
+            self.add_task_prompt,
+        )
 
-def collate_fn(batch):
-    """Simple collate function for the dataloader - keeps boxes and categories as lists"""
-    return {
-        'images': torch.stack([item['image'] for item in batch]),
-        'captions': [item['caption'] for item in batch],
-        'boxes': [item['boxes'] for item in batch],
-        'categories': [item['categories'] for item in batch],
-        'positive_maps': [item['positive_map'] for item in batch],
-        'original_sizes': [item['original_size'] for item in batch]
-    }
+        return image_tensor, [target]
+
+    def __len__(self):
+        return len(self.image_ids)
+    
 
 class GLIP(nn.Module):
-    def __init__(self, hidden_dim=256, num_classes=80):
+    def __init__(self, hidden_dim=256, num_classes=None):
         super().__init__()
+        # For COCO, num_classes is 80 (91 total with background, but we use 80 for detection)
+        if num_classes is None:
+            num_classes = 80  # COCO default
+        
         self.backbone = GLIPBackbone()
         self.dyhead = VLDyHead(hidden_dim=hidden_dim)
         self.head = GLIPHead(hidden_dim=hidden_dim, num_classes=num_classes)
         
-    def forward(self, images, original_sizes, captions, targets=None):
+    def forward(self, images, original_sizes, captions):
+        """Forward pass without loss computation"""
         # Get backbone features
         features = self.backbone(images, original_sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
-            'visual': list(features['visual']['features'].values()),
+            'visual': list(features['visual'].values()),
+            'visual_masks': list(features['visual_masks'].values()),  # Add masks
             'lang': features['language']
         })
         
         # Get predictions from head
-        predictions = self.head(
-            fused_features['visual'],
-            fused_features['lang']
-        )
+        head_input = {
+            'visual': fused_features['visual'],
+            'lang': fused_features['lang'],
+            'original_sizes': original_sizes
+        }
         
-        if self.training and targets is not None:
-            losses = self.head.loss(
-                predictions, 
-                targets,
-                text_masks=features['language']['masks']
-            )
-            return losses
+        predictions= self.head(head_input)
+        # Return predictions and text masks for loss computation
+        return predictions, features['language']['masks']
+
+
+def train_step(model, batch, optimizer, device):
+    images, targets, original_sizes, captions = prepare_batch(batch, device)
+    
+    # Forward pass with separated inputs
+    predictions = model(images, original_sizes, captions)
+    
+    # Compute losses
+    losses = compute_losses(predictions, targets)
+    
+    # Total loss
+    total_loss = sum(losses.values())
+    
+    # Backward pass
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    
+    return losses
+
+
+def inference_step(model, batch, device):
+    model.eval()
+    with torch.no_grad():
+        images, targets = prepare_batch(batch, model, device)
+        predictions, _ = model(images, targets)
         return predictions
+
 
 def train_glip():
 
@@ -138,15 +176,19 @@ def train_glip():
     model = GLIP(hidden_dim=256, num_classes=classes)
     model = model.to(device)
 
+    tokenizer = model.backbone.tokenizer
+
     # Dataset setup
     train_dataset = COCOGLIPDataset(
         coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_train2017.json',
-        image_dir='/home/asad/dev/GLIP/DATASET/coco/train2017'
+        image_dir='/home/asad/dev/GLIP/DATASET/coco/train2017',
+        tokenizer=tokenizer
     )
     
     val_dataset = COCOGLIPDataset(
         coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_val2017.json',
-        image_dir='/home/asad/dev/GLIP/DATASET/coco/val2017'
+        image_dir='/home/asad/dev/GLIP/DATASET/coco/val2017',
+        tokenizer=tokenizer
     )
     
     train_loader = DataLoader(
@@ -154,7 +196,7 @@ def train_glip():
         batch_size=2,
         shuffle=True,
         num_workers=4,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: tuple(zip(*x)),
         pin_memory=True
     )
     
@@ -163,7 +205,7 @@ def train_glip():
         batch_size=2,
         shuffle=False,
         num_workers=4,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: tuple(zip(*x)),
         pin_memory=True
     )
 
@@ -180,32 +222,7 @@ def train_glip():
         
         for batch_idx, batch in enumerate(train_loader):
             # Move data to device
-            images = batch['images'].to(device)
-            boxes = [b.to(device) for b in batch['boxes']]
-            categories = [c.to(device) for c in batch['categories']]
-            positive_maps = [p.to(device) for p in batch['positive_maps']]
-            
-            targets = {
-                'boxes': boxes,
-                'labels': categories,
-                'positive_maps': positive_maps
-            }
-            
-            # Forward pass
-            optimizer.zero_grad()
-            losses = model(
-                images,
-                batch['original_sizes'],
-                batch['captions'],
-                targets
-            )
-            
-            # Compute total loss
-            total_batch_loss = sum(losses.values())
-            
-            # Backward pass
-            total_batch_loss.backward()
-            optimizer.step()
+            total_batch_loss = train_step(model, batch, optimizer, device)
             
             total_loss += total_batch_loss.item()
             
