@@ -6,7 +6,9 @@ from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionPro
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
 from glip import TokenSigmoidFocalLoss
 from torchvision.models.detection.image_list import ImageList
-import torchvision.transforms.functional as F
+#import torchvision.transforms.functional as F
+import torch.nn.functional as F 
+
 
 
 class GLIPHead(nn.Module):
@@ -104,8 +106,13 @@ class GLIPHead(nn.Module):
             
             # Get ROI features for grounding
             box_features = self.box_head(
-                self.roi_pooler(features_dict, [t["boxes"] for t in targets])
+                self.roi_pooler(
+                    features_dict, 
+                    [t["boxes"] for t in targets],
+                    image_sizes
+                )
             )
+
             grounding_features = self.grounding_head(box_features)
             text_features = language_dict['hidden']
             
@@ -114,11 +121,13 @@ class GLIPHead(nn.Module):
                 grounding_features,
                 text_features.transpose(-2, -1)
             )
+
+            positive_maps = torch.cat([t['positive_map'] for t in targets], dim=0) 
             
             # Compute grounding loss
             grounding_loss = self.token_loss(
                 grounding_scores,
-                torch.stack([t['positive_map'] for t in targets]),
+                positive_maps,
                 text_masks=language_dict.get('masks')
             )
             
@@ -143,7 +152,8 @@ class GLIPHead(nn.Module):
             if len(detections[0]['boxes']) > 0:
                 det_features = self.roi_pooler(
                     features_dict,
-                    [d['boxes'] for d in detections]
+                    [d['boxes'] for d in detections],
+                    image_sizes  # Add image_sizes here
                 )
                 det_features = self.box_head(det_features)
                 grounding_features = self.grounding_head(det_features)

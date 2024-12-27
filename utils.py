@@ -391,13 +391,14 @@ class Normalize(object):
         image = F.normalize(image, mean=self.mean, std=self.std)
         if target is None:
             return image, None
-        target = target.copy()
-        h, w = image.shape[-2:]
-        if "boxes" in target:
-            boxes = target["boxes"]
-            boxes = box_xyxy_to_cxcywh(boxes)
-            boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
-            target["boxes"] = boxes
+        # Donot modfy boxes because RPN from torchvision requires boxes in x1,x2,y1,y2 without noramlization
+        #target = target.copy()
+        #h, w = image.shape[-2:]
+        #if "boxes" in target:
+        #    boxes = target["boxes"]
+        #    boxes = box_xyxy_to_cxcywh(boxes)
+        #    boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
+        #    target["boxes"] = boxes
         return image, target
 
 
@@ -650,10 +651,7 @@ def prepare_batch(batch, device):
     Prepare batch for training by moving tensors to device and handling nested tensors.
     Returns images, targets, original_sizes, and captions separately.
     """
-    images, target_lists = batch  # Now each item in batch is (image, [target])
-    
-    # Flatten list of lists of targets
-    targets = [t[0] for t in target_lists]  # Get first (and only) target from each list
+    images, targets = batch  # Now each item in batch is (image, [target])
     
     # Extract captions and sizes
     captions = [t['caption'] for t in targets]

@@ -20,7 +20,7 @@ class GLIPBackbone(nn.Module):
         self.features = swin.features  
         
         channels = {
-            'p1': 128,   
+            #'p1': 128,   
             'p2': 256,   
             'p3': 512,   
             'p4': 1024   
@@ -41,10 +41,6 @@ class GLIPBackbone(nn.Module):
         """Get proper FPN features (P2-P6) from Swin backbone"""
         tensors, mask = images.decompose()
         valid_mask = ~mask
-
-        input_h, input_w = tensors.shape[2:]
-        print(f"\nInput size: {input_h}x{input_w}")
-        
         features = {}
         feature_masks = {}
         
@@ -55,7 +51,7 @@ class GLIPBackbone(nn.Module):
             x = layer(x)
             
             # Take features from the second layer of each stage
-            if i in [1, 3, 5, 7]:  
+            if i in [3, 5, 7]:  
                 level = f'p{(i//2)+1}' 
                 
                 # Convert from [B, H, W, C] to [B, C, H, W]
@@ -63,13 +59,7 @@ class GLIPBackbone(nn.Module):
                 
                 # Project to common dimension
                 feat = self.feature_proj[level](feat)
-
-                curr_h, curr_w = feat.shape[2:]
-                actual_stride_h = input_h // curr_h
-                actual_stride_w = input_w // curr_w
-                print(f"\n{level} output size: {curr_h}x{curr_w}")
-                print(f"{level} stride: {actual_stride_h}x{actual_stride_w} " )
-                
+               
                 # Get mask for this level
                 feat_mask = F.interpolate(valid_mask[None].float(), 
                                         size=feat.shape[-2:],
@@ -80,26 +70,26 @@ class GLIPBackbone(nn.Module):
                 feature_masks[level] = feat_mask
         
         # Add P5
-        #p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
-        #p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
-        #                      size=p5.shape[-2:],
-        #                      mode='nearest')[0].bool()
-        #features['p5'] = p5 * p5_mask.unsqueeze(1).float()
-        #feature_masks['p5'] = p5_mask
+        p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
+        p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
+                              size=p5.shape[-2:],
+                              mode='nearest')[0].bool()
+        features['p5'] = p5 * p5_mask.unsqueeze(1).float()
+        feature_masks['p5'] = p5_mask
         
         return features, feature_masks
 
     def get_text_features(self, captions, device):
         """Process text through BERT"""
-        # Tokenize
+        # Tokenize padding can be "longest" then all elements will not be scaled to max query length
         tokens = self.tokenizer(
             captions,
-            padding=True,
-            truncation=True,
+            padding='max_length',
+            return_special_tokens_mask=True,
             max_length=self.max_query_len,
             return_tensors="pt"
         ).to(device)
-        
+
         # Get BERT features
         text_outputs = self.bert(
             input_ids=tokens.input_ids,
@@ -180,127 +170,139 @@ class VLDyHead(nn.Module):
         return x
 
 class BiMultiHeadAttention(nn.Module):
-    def __init__(self, v_dim=256, l_dim=768, embed_dim=2048, num_heads=8, dropout=0.1):
+    def __init__(self, v_dim=256, l_dim=768, embed_dim=256, num_heads=8, dropout=0.1):
         super().__init__()
+        self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.v_dim = v_dim
+        self.l_dim = l_dim
+        self.scale = self.head_dim ** (-0.5)
+        self.dropout = dropout
+
+        self.v_proj = nn.Linear(self.v_dim, embed_dim)
+        self.l_proj = nn.Linear(self.l_dim, embed_dim)
+        self.values_v_proj = nn.Linear(self.v_dim, embed_dim)
+        self.values_l_proj = nn.Linear(self.l_dim, embed_dim)
         
-        # Project to common dimension with correct scaling
-        self.v_proj = nn.Linear(v_dim, embed_dim)
-        self.l_proj = nn.Linear(l_dim, embed_dim)
-        self.values_v_proj = nn.Linear(v_dim, embed_dim)
-        self.values_l_proj = nn.Linear(l_dim, embed_dim)
-        
-        # Project back
         self.out_v_proj = nn.Linear(embed_dim, v_dim)
         self.out_l_proj = nn.Linear(embed_dim, l_dim)
+
+        # Add stability controls
+        self.clamp_min_for_underflow = True
+        self.clamp_max_for_overflow = True
         
-        # Initialize projections with small weights for stability
         self._reset_parameters()
-        
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
     def _reset_parameters(self):
-        for proj in [self.v_proj, self.l_proj, self.values_v_proj, self.values_l_proj]:
-            fan_out = proj.weight.size(0)
-            std = (2.0 / fan_out) ** 0.5
-            nn.init.normal_(proj.weight, mean=0, std=std)
-            nn.init.zeros_(proj.bias)
+        for proj in [self.v_proj, self.l_proj, self.values_v_proj, self.values_l_proj, 
+                    self.out_v_proj, self.out_l_proj]:
+            nn.init.xavier_uniform_(proj.weight)
+            proj.bias.data.fill_(0)
             
-    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
-        B, Hv, _ = v.shape
-        _, Hl, _ = l.shape
+    def forward(self, v, l, attention_mask_l=None):
+        bsz, tgt_len, _ = v.size()
+
+        query_states = self.v_proj(v) * self.scale
+        key_states = self._shape(self.l_proj(l), -1, bsz)
+        value_v_states = self._shape(self.values_v_proj(v), -1, bsz)
+        value_l_states = self._shape(self.values_l_proj(l), -1, bsz)
         
-        # 1. Project to common dimension with scaling
-        q = self.v_proj(v) * self.scaling 
-        k = self.l_proj(l)
-        v_value = self.values_v_proj(v)
-        l_value = self.values_l_proj(l)
-        
-        # 2. Reshape
-        q = q.view(B, Hv, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, Hl, self.num_heads, self.head_dim).transpose(1, 2)
-        v_value = v_value.view(B, Hv, self.num_heads, self.head_dim).transpose(1, 2)
-        l_value = l_value.view(B, Hl, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # 3. Attention with mask handling
-        attn = torch.matmul(q, k.transpose(-2, -1))
-        
-        # Apply language mask (B, L) -> (B, 1, 1, L)
+        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        key_states = key_states.view(*proj_shape)
+        value_v_states = value_v_states.view(*proj_shape)
+        value_l_states = value_l_states.view(*proj_shape)
+
+        src_len = key_states.size(1)
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        # Clamping is important for stability and OOO CUDA ERROR
+        attn_weights = torch.clamp(torch.clamp(attn_weights, min=-50000), max=50000)
+
+        attn_weights_T = attn_weights.transpose(1, 2)
+        attn_weights_l = (attn_weights_T - torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+         # Clamping is important for stability and OOO CUDA ERROR
+        attn_weights_l = torch.clamp(torch.clamp(attn_weights_l, min=-50000), max=50000)
+        attn_weights_l = attn_weights_l.softmax(dim=-1)
+
         if attention_mask_l is not None:
-            attn_mask_l = attention_mask_l.bool()
-            attn_mask_l = attn_mask_l.unsqueeze(1).unsqueeze(1)
-            attn_mask_l = attn_mask_l.expand(B, self.num_heads, Hv, -1)
-            attn = attn.masked_fill(~attn_mask_l, -1e4)
-        
-        # Apply vision mask (B, H, W) -> (B, 1, HW, 1)
-        if attention_mask_v is not None:
-            attn_mask_v = attention_mask_v.bool()
-            attn_mask_v = attn_mask_v.view(B, 1, Hv, 1)
-            attn_mask_v = attn_mask_v.expand(B, self.num_heads, -1, Hl)
-            attn = attn.masked_fill(~attn_mask_v, -1e4)
-            
-        # 4. Normalized attention scores
-        attn_v = F.softmax(attn, dim=-1)
-        attn_l = F.softmax(attn.transpose(-2, -1), dim=-1)
-        
-        # 5. Compute outputs
-        out_v = torch.matmul(attn_v, l_value)
-        out_l = torch.matmul(attn_l, v_value)
-        
-        # 6. Reshape and project back
-        out_v = out_v.transpose(1, 2).reshape(B, Hv, -1)
-        out_l = out_l.transpose(1, 2).reshape(B, Hl, -1)
-        
-        return self.out_v_proj(out_v), self.out_l_proj(out_l)
+            assert (attention_mask_l.dim() == 2)
+            attention_mask = attention_mask_l.unsqueeze(1).unsqueeze(1)
+            attention_mask = attention_mask.expand(bsz, 1, tgt_len, src_len)
+            attention_mask = attention_mask.masked_fill(attention_mask == 0, -9e15)
+
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}"
+                )
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+
+        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
+
+        attn_probs_v = F.dropout(attn_weights_v, p=self.dropout, training=self.training)
+        attn_probs_l = F.dropout(attn_weights_l, p=self.dropout, training=self.training)
+
+        attn_output_v = torch.bmm(attn_probs_v, value_l_states)
+        attn_output_l = torch.bmm(attn_probs_l, value_v_states)
+
+        attn_output_v = attn_output_v.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output_v = attn_output_v.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+
+        attn_output_l = attn_output_l.view(bsz, self.num_heads, src_len, self.head_dim)
+        attn_output_l = attn_output_l.transpose(1, 2).reshape(bsz, src_len, self.embed_dim)
+
+        attn_output_v = self.out_v_proj(attn_output_v)
+        attn_output_l = self.out_l_proj(attn_output_l)
+
+        return attn_output_v, attn_output_l
+
 
 class BiAttentionBlock(nn.Module):
-    def __init__(self, v_dim=256, l_dim=768, embed_dim=2048, num_heads=8, dropout=0.1, init_values=1e-4):
+    def __init__(self, v_dim=256, l_dim=768, embed_dim=256, num_heads=8, dropout=0.1):
         super().__init__()
-        
-        # Layer norms 
         self.layer_norm_v = nn.LayerNorm(v_dim)
         self.layer_norm_l = nn.LayerNorm(l_dim)
-        
-        # Cross attention with proper scaling
-        self.attn = BiMultiHeadAttention(
-            v_dim=v_dim,
-            l_dim=l_dim,
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout
-        )
-        
-        # Layer scale init 
+        self.attn = BiMultiHeadAttention(v_dim, l_dim, embed_dim, num_heads, dropout)
         self.gamma_v = nn.Parameter(torch.ones(v_dim) * 0.125)
         self.gamma_l = nn.Parameter(torch.ones(l_dim) * 0.125)
-    
+        self.drop_path = nn.Identity()
+
     def forward(self, visual_feats, visual_masks, lang_feats, lang_masks):
-        fused_visual = []
-        
-        for feat, feat_mask in zip(visual_feats, visual_masks):
-            # 1. Prepare visual features
+        visu_feat = []
+        size_per_level = []
+        visual_features_flatten = []
+
+        # Flatten all levels into one sequence
+        for feat in visual_feats:
             bs, c, h, w = feat.shape
-            v = feat.flatten(2).transpose(1, 2)  # [B, HW, 256]
-            v_mask = feat_mask.flatten(1)  # [B, HW]
-            
-            # 2. Pre-norm
-            v = self.layer_norm_v(v)
-            l = self.layer_norm_l(lang_feats)
-            
-            # 3. Cross attention with masks
-            delta_v, delta_l = self.attn(v, l, 
-                                       attention_mask_v=v_mask,
-                                       attention_mask_l=lang_masks)
-            
-            # 4. Layer scale and residual
-            v = v + self.gamma_v * delta_v
-            l = lang_feats + self.gamma_l * delta_l
-            
-            # 5. Reshape visual and maintain mask
-            v = v.transpose(1, 2).reshape(bs, c, h, w)
-            fused_visual.append(v)
-            
-        return fused_visual, l
+            size_per_level.append([h, w])
+            feat = feat.flatten(2).transpose(1, 2)  # [B, H*W, C]
+            visual_features_flatten.append(feat)
+        
+        # Concatenate all levels
+        visual_features_flatten = torch.cat(visual_features_flatten, dim=1)
+        
+        # Single attention call for all levels
+        v = self.layer_norm_v(visual_features_flatten)
+        l = self.layer_norm_l(lang_feats)
+        delta_v, delta_l = self.attn(v, l, attention_mask_l=lang_masks)
+        v = visual_features_flatten + self.drop_path(self.gamma_v * delta_v)
+        l = lang_feats + self.drop_path(self.gamma_l * delta_l)
+
+        # Split back per level
+        v = v.transpose(1, 2)  # [B, C, N]
+        start = 0
+        for h, w in size_per_level:
+            v_level = v[:, :, start:start + h*w].reshape(bs, -1, h, w)
+            visu_feat.append(v_level)
+            start += h * w
+
+        return visu_feat, l
 
 class VLFuse(nn.Module):
     def __init__(self, hidden_dim=256):
@@ -310,8 +312,7 @@ class VLFuse(nn.Module):
             l_dim=768,
             embed_dim=2048,
             num_heads=8,
-            dropout=0.1,
-            init_values=1e-4
+            dropout=0.1
         )
     
     def forward(self, x):
@@ -367,11 +368,6 @@ class BertAttention(nn.Module):
     def forward(self, x, mask=None):
         bsz, seq_len, _ = x.shape
         
-        # Check input for NaN
-        #if torch.isnan(x).any():
-        #    print("NaN in attention input")
-        #    return x
-            
         x = self.norm(x)
         
         # Project to Q, K, V
@@ -570,7 +566,7 @@ class TokenSigmoidFocalLoss(nn.Module):
             loss_func = token_sigmoid_binary_focal_loss
         else:
             raise NotImplementedError
-        loss = loss_func(logits, targets, self.alpha, self.gamma, text_masks, kwargs)
+        loss = loss_func(logits, targets, self.alpha, self.gamma, text_masks)
         return loss.sum()
 
     def repr(self):
@@ -664,13 +660,7 @@ def compute_losses(predictions, targets, text_masks=None):
             target_level['boxes'],
             reduction='mean'
         )
-        
-        # Centerness loss
-        loss_centerness += F.binary_cross_entropy_with_logits(
-            pred_level['centers'],
-            target_level['centers'],
-            reduction='mean'
-        )
+
         
         # Grounding loss using token focal loss
         loss_grounding += token_sigmoid_binary_focal_loss(
@@ -683,29 +673,6 @@ def compute_losses(predictions, targets, text_masks=None):
     
     return {
         'loss_bbox': loss_bbox,
-        'loss_centerness': loss_centerness,
         'loss_grounding': loss_grounding
     }
 
-
-# Example usage:
-if __name__ == '__main__':
-    backbone = GLIPBackbone()
-    
-    # Batch with different sizes
-    batch_size = 2
-    images = torch.randn(batch_size, 3, 800, 1200)  # Resized images
-    original_sizes = [(1080, 1920), (720, 1280)]    # Original sizes before resize
-    captions = [
-        "A person riding a bicycle",
-        "A dog playing in the park" 
-    ]
-    
-    outputs = backbone(images, original_sizes, captions)
-    
-    # Print shapes
-    for level, feat in outputs['visual']['features'].items():
-        print(f"{level} shape:", feat.shape)
-        
-    print("Text hidden shape:", outputs['language']['hidden'].shape)
-    print("Text mask shape:", outputs['language']['masks'].shape)

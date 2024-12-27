@@ -41,7 +41,7 @@ class COCOGLIPDataset(Dataset):
         # Transform pipeline
         if transforms is None:
             self.transforms = Compose([
-                RandomResize([800], max_size=400),
+                RandomResize([800], max_size=800),
                 ToTensor(),
                 Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
@@ -69,26 +69,27 @@ class COCOGLIPDataset(Dataset):
         categories = []
         str_cls_lst = []
         for ann in annotations:
-            x, y, w_box, h_box = ann['bbox']
-            # Convert to xyxy format
-            x1 = x
-            y1 = y
-            x2 = x + w_box
-            y2 = y + h_box
-            boxes.append([x1, y1, x2, y2])  # xyxy format
+            x1, y1, w_box, h_box = ann['bbox']
+            # Convert to center format [cx,cy,w,h]
+            x2 = x1 + w_box
+            y2 = y1 + h_box
+            boxes.append([x1, y1, x2, y2])
             categories.append(ann['category_id'])
             cat_name = self.coco.loadCats([ann['category_id']])[0]['name']
             str_cls_lst.append(cat_name)
         
-        # Create target dict in torchvision format
+        # Create initial target dict
         target = {
-            'boxes': torch.tensor(boxes, dtype=torch.float32),  # xyxy format
+            'boxes': torch.tensor(boxes, dtype=torch.float32),
+            'size': torch.as_tensor([int(h), int(w)]),
             'labels': torch.tensor(categories, dtype=torch.long),
-            'image_id': torch.tensor([image_id]),
+            'image_id': image_id,
+            # Add required fields for torchvision
             'area': torch.tensor([ann['area'] for ann in annotations]),
-            'iscrowd': torch.tensor([ann['iscrowd'] for ann in annotations]),
-            # Optional for GLIP
-            'str_cls_lst': str_cls_lst}
+            'iscrowd': torch.tensor([ann.get('iscrowd', 0) for ann in annotations]),
+
+            'str_cls_lst': str_cls_lst,
+        }
         
         # Apply transforms to both image and target
         image_tensor, target = self.transforms(image_source, target)
@@ -102,7 +103,7 @@ class COCOGLIPDataset(Dataset):
             self.add_task_prompt,
         )
 
-        return image_tensor, [target]
+        return image_tensor, target
 
     def __len__(self):
         return len(self.image_ids)
@@ -119,7 +120,7 @@ class GLIP(nn.Module):
         self.dyhead = VLDyHead(hidden_dim=hidden_dim)
         self.head = GLIPHead(hidden_dim=hidden_dim, num_classes=num_classes)
         
-    def forward(self, images, original_sizes, captions):
+    def forward(self, images, original_sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
         features = self.backbone(images, original_sizes, captions)
@@ -135,7 +136,8 @@ class GLIP(nn.Module):
         head_input = {
             'visual': fused_features['visual'],
             'lang': fused_features['lang'],
-            'original_sizes': original_sizes
+            'original_sizes': original_sizes,
+            'targets': targets
         }
         
         predictions= self.head(head_input)
@@ -147,7 +149,7 @@ def train_step(model, batch, optimizer, device):
     images, targets, original_sizes, captions = prepare_batch(batch, device)
     
     # Forward pass with separated inputs
-    predictions = model(images, original_sizes, captions)
+    predictions = model(images, original_sizes, captions,targets)
     
     # Compute losses
     losses = compute_losses(predictions, targets)
@@ -212,7 +214,6 @@ def train_glip():
         pin_memory=True
     )
 
-    
     # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
