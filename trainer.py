@@ -17,6 +17,7 @@ from rpn_head import GLIPHead
 from anchor_generator import anchor_generator_simple
 from bounding_box import BoxList
 from glip_loss import GLIPLoss
+from image_list import ImageList
 
 
 
@@ -91,7 +92,6 @@ class COCOGLIPDataset(Dataset):
         # Create initial target dict
         target = {
             'boxes': boxes,
-            'size': torch.as_tensor([int(h), int(w)]),
             'labels': torch.tensor(categories, dtype=torch.long),
             'image_id': image_id,
             # Add required fields for torchvision
@@ -105,6 +105,7 @@ class COCOGLIPDataset(Dataset):
         image_tensor, boxes = self.transforms(image_source, target["boxes"])
         # Replace boxes in targes with rescaled boxes
         target['boxes']=boxes
+        target['size']=torch.as_tensor(image_tensor.shape[-2:])
         
         target = convert_od_to_grounding_data(
             target,
@@ -134,10 +135,10 @@ class GLIP(nn.Module):
         self.head = GLIPHead(in_channels=hidden_dim, num_classes=num_classes)
         self.loss_calculator = GLIPLoss()
         
-    def forward(self, images, original_sizes, captions,targets=None):
+    def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        features = self.backbone(images, original_sizes, captions)
+        features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
@@ -157,7 +158,9 @@ class GLIP(nn.Module):
         logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
         
         if self.training and targets is not None:
-            anchors = self.anchor_generator(images, fused_features['visual'])
+            
+            images_list=ImageList(images.tensors,sizes)
+            anchors = self.anchor_generator(images_list, fused_features['visual'])
             losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
             return losses
         
@@ -167,11 +170,11 @@ class GLIP(nn.Module):
 
 
 def train_step(model, batch, optimizer, device):
-    images, targets, original_sizes, captions = prepare_batch(batch, device)
+    images, targets, sizes, captions = prepare_batch(batch, device)
     
     # Forward pass with separated inputs
     with torch.autocast(device_type="cuda",dtype=torch.float16):
-        predictions = model(images, original_sizes, captions,targets)
+        predictions = model(images, sizes, captions,targets)
     
     # Compute losses
     losses = compute_losses(predictions, targets)
@@ -196,11 +199,9 @@ def inference_step(model, batch, device):
 
 
 def train_glip():
-
-    classes=81
     # Model setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = GLIP(hidden_dim=256, num_classes=classes)
+    model = GLIP(hidden_dim=256)
     model = model.to(device)
 
     tokenizer = model.backbone.tokenizer

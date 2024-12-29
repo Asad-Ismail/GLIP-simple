@@ -100,11 +100,11 @@ class GLIPBackbone(nn.Module):
             'input_ids': tokens.input_ids
         }
 
-    def forward(self, images, original_sizes, captions):
+    def forward(self, images, sizes, captions):
         """
         Args:
             images: NestedTensor with tensors and mask
-            original_sizes: original image sizes before preprocessing
+            sizes: image sizes before batching but after transformations
             captions: list of text queries
         """
         device = images.tensors.device
@@ -120,7 +120,7 @@ class GLIPBackbone(nn.Module):
             'visual': visual_feats,
             'visual_masks': visual_masks,  # Add masks for attention
             'language': text_feats,
-            'original_sizes': original_sizes
+            'sizes': sizes
         }
 
 class VLDyHead(nn.Module):

@@ -738,7 +738,7 @@ def prepare_batch(batch, device):
     
     # Extract captions and sizes
     captions = [t['caption'] for t in targets]
-    original_sizes = [t['size'] for t in targets]
+    sizes = [t['size'] for t in targets]
     
     # Convert list of images to NestedTensor 
     if isinstance(images, (list, tuple)):
@@ -751,7 +751,7 @@ def prepare_batch(batch, device):
             if isinstance(v, torch.Tensor):
                 target[k] = v.to(device)
     
-    return images, targets, original_sizes, captions
+    return images, targets, sizes, captions
 
 
 
