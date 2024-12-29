@@ -158,16 +158,14 @@ class GLIP(nn.Module):
         logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
         
         if self.training and targets is not None:
-            
+            # Only size of these image list is used to create anchors TODO Change it allow anchor generator to also expect only sizes to generator anchors
             images_list=ImageList(images.tensors,sizes)
             anchors = self.anchor_generator(images_list, fused_features['visual'])
             losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
             return losses
         
         return logits, bbox_reg, centerness, dot_product_logits
-        # Return predictions and text masks for loss computation
        
-
 
 def train_step(model, batch, optimizer, device):
     images, targets, sizes, captions = prepare_batch(batch, device)

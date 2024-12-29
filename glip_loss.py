@@ -142,8 +142,8 @@ class GLIPLoss(nn.Module):
         self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)
 
     def forward(self, logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions):
-
-        labels, reg_targets, token_labels = self.prepare_targets(targets, anchors, captions)
+        # Pass only boxes for preparing targets
+        labels, reg_targets, token_labels = self.prepare_targets([item['boxes'] for item in targets], anchors, captions)
 
         N = len(labels)
 
