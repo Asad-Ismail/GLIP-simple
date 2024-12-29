@@ -41,6 +41,9 @@ class COCOGLIPDataset(Dataset):
         # Get category information and mapping
         self.categories = self.coco.loadCats(self.coco.getCatIds())
         self.ind_to_class = {cat['id']: cat['name'] for cat in self.categories}
+
+        self.json_category_id_to_contiguous_id = {v: i + 1 for i, v in enumerate(self.coco.getCatIds())}
+        self.contiguous_category_id_to_json_id = {v: k for k, v in self.json_category_id_to_contiguous_id.items()}
         
         # Get image ids
         self.image_ids = list(self.coco.imgs.keys())
@@ -55,7 +58,6 @@ class COCOGLIPDataset(Dataset):
             ])
         else:
             self.transforms = transforms
-
 
 
     def __getitem__(self, idx: int):
@@ -88,6 +90,11 @@ class COCOGLIPDataset(Dataset):
         
         boxes = torch.as_tensor(boxes).reshape(-1, 4)  # guard against no boxes
         boxes = BoxList(boxes, image_source.size, mode="xywh").convert("xyxy")
+
+        # Add classes to boxes directly so we only need to pass boxes as targets
+        classes = [self.json_category_id_to_contiguous_id[c] for c in categories]
+        classes = torch.tensor(classes)
+        boxes.add_field("labels", classes)
 
         # Create initial target dict
         target = {
