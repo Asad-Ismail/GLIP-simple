@@ -4,6 +4,9 @@ from torchvision.ops.focal_loss import sigmoid_focal_loss
 import math
 from utils import concat_box_prediction_layers
 from boxlist_ops import cat_boxlist
+from boxlist_ops import boxlist_iou
+
+INF = 1e8
 
 
 class BoxCoder(object):
@@ -145,10 +148,10 @@ class GLIPLoss(nn.Module):
 
         N = len(labels)
 
-        box_regression_flatten, box_cls_flatten, token_logits_stacked = concat_box_prediction_layers(
+        box_regression_flatten, box_cls_flatten, _ =  concat_box_prediction_layers(
             bbox_reg,
             logits,
-        dot_product_logits,
+            None,
         )
         
         dot_product_logits = torch.cat(dot_product_logits, dim=1)
@@ -191,10 +194,6 @@ class GLIPLoss(nn.Module):
         }
         
         return losses
-
-    def prepare_targets(self, targets, anchors, captions):
-        # Implement target preparation here
-        pass
 
     def prepare_targets(self, targets, anchors, tokenized=None, positive_map=None, proj_tokens=None):
         cls_labels = []
