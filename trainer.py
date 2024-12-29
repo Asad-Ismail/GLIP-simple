@@ -9,10 +9,14 @@ import numpy as np
 from typing import Tuple, Dict, List
 from transformers import BertTokenizer
 import os
-from utils import build_id2posspan_and_caption, create_positive_map_from_span, RandomResize,ToTensor,Normalize,Compose,build_captions_and_token_span
-from utils import nested_tensor_from_tensor_list,prepare_batch,convert_od_to_grounding_data
+from utils import Resize,ToTensor,Normalize,Compose
+from utils import prepare_batch,convert_od_to_grounding_data
 from glip import GLIPBackbone,VLDyHead,compute_losses
-from head import GLIPHead
+#from head import GLIPHead
+from rpn_head import GLIPHead
+from anchor_generator import anchor_generator_simple
+from bounding_box import BoxList
+from glip_loss import GLIPLoss
 
 class COCOGLIPDataset(Dataset):
     def __init__(self, 
@@ -41,7 +45,8 @@ class COCOGLIPDataset(Dataset):
         # Transform pipeline
         if transforms is None:
             self.transforms = Compose([
-                RandomResize([800], max_size=800),
+                #Resize((480, 560, 640, 720, 800), max_size=1333),
+                Resize((480), max_size=600),
                 ToTensor(),
                 Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
@@ -78,9 +83,12 @@ class COCOGLIPDataset(Dataset):
             cat_name = self.coco.loadCats([ann['category_id']])[0]['name']
             str_cls_lst.append(cat_name)
         
+        boxes = torch.as_tensor(boxes).reshape(-1, 4)  # guard against no boxes
+        boxes = BoxList(boxes, image_source.size, mode="xywh").convert("xyxy")
+
         # Create initial target dict
         target = {
-            'boxes': torch.tensor(boxes, dtype=torch.float32),
+            'boxes': boxes,
             'size': torch.as_tensor([int(h), int(w)]),
             'labels': torch.tensor(categories, dtype=torch.long),
             'image_id': image_id,
@@ -92,7 +100,9 @@ class COCOGLIPDataset(Dataset):
         }
         
         # Apply transforms to both image and target
-        image_tensor, target = self.transforms(image_source, target)
+        image_tensor, boxes = self.transforms(image_source, target["boxes"])
+        # Replace boxes in targes with rescaled boxes
+        target['boxes']=boxes
         
         target = convert_od_to_grounding_data(
             target,
@@ -118,7 +128,9 @@ class GLIP(nn.Module):
         
         self.backbone = GLIPBackbone()
         self.dyhead = VLDyHead(hidden_dim=hidden_dim)
-        self.head = GLIPHead(hidden_dim=hidden_dim, num_classes=num_classes)
+        self.anchor_generator=anchor_generator_simple()
+        self.head = GLIPHead(in_channels=hidden_dim, num_classes=num_classes)
+        self.loss_calculator = GLIPLoss()
         
     def forward(self, images, original_sizes, captions,targets=None):
         """Forward pass without loss computation"""
@@ -136,20 +148,28 @@ class GLIP(nn.Module):
         head_input = {
             'visual': fused_features['visual'],
             'lang': fused_features['lang'],
-            'original_sizes': original_sizes,
-            'targets': targets
+            #'original_sizes': original_sizes,
+            #'targets': targets
         }
         
-        predictions= self.head(head_input)
+        logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
+        
+        if self.training and targets is not None:
+            anchors = self.anchor_generator(images, fused_features['visual'])
+            losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
+            return losses
+        
+        return logits, bbox_reg, centerness, dot_product_logits
         # Return predictions and text masks for loss computation
-        return predictions, features['language']['masks']
+       
 
 
 def train_step(model, batch, optimizer, device):
     images, targets, original_sizes, captions = prepare_batch(batch, device)
     
     # Forward pass with separated inputs
-    predictions = model(images, original_sizes, captions,targets)
+    with torch.autocast(device_type="cuda",dtype=torch.float16):
+        predictions = model(images, original_sizes, captions,targets)
     
     # Compute losses
     losses = compute_losses(predictions, targets)
@@ -185,13 +205,13 @@ def train_glip():
 
     # Dataset setup
     train_dataset = COCOGLIPDataset(
-        coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_train2017.json',
+        coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_train2017_subset.json',
         image_dir='/home/asad/dev/GLIP/DATASET/coco/train2017',
         tokenizer=tokenizer
     )
     
     val_dataset = COCOGLIPDataset(
-        coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_val2017.json',
+        coco_path='/home/asad/dev/GLIP/DATASET/coco/annotations/instances_val2017_subset.json',
         image_dir='/home/asad/dev/GLIP/DATASET/coco/val2017',
         tokenizer=tokenizer
     )

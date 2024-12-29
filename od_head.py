@@ -92,13 +92,14 @@ class GLIPHead(nn.Module):
         proposals, rpn_losses = self.rpn(image_list, features_dict, targets)
         
         if self.training and targets is not None:
+            matched_idxs_list = []
+            with torch.no_grad():
+                # Get matched indices first
+                matched_idxs = self.roi_heads.select_training_samples(proposals, targets)[1]
+                matched_idxs_list.extend(matched_idxs)
+
             # Get detection losses but zero out classification loss
-            detector_losses = self.roi_heads(
-                features_dict,
-                proposals,
-                image_sizes,
-                targets
-            )[1]
+            detector_losses = self.roi_heads(features_dict, proposals, image_sizes, targets)[1]
             
             # Zero out classification loss
             if 'loss_classifier' in detector_losses:
@@ -116,21 +117,38 @@ class GLIPHead(nn.Module):
             grounding_features = self.grounding_head(box_features)
             text_features = language_dict['hidden']
             
-            # Compute grounding scores and loss
-            grounding_scores = torch.matmul(
-                grounding_features,
-                text_features.transpose(-2, -1)
-            )
+            # Process each image in batch separately
+            batch_losses = []
+            start_idx = 0
+            for i, matched_idxs in enumerate(matched_idxs_list):
+                # Get positive matches for this image
+                positive_idxs = (matched_idxs > 0).nonzero().squeeze(1)
+                gt_box_indices = matched_idxs[positive_idxs] - 1  # -1 to convert to 0-based indexing
+                
+                # Get features for positive matches
+                curr_grounding_features = grounding_features[start_idx:start_idx + len(targets[i]["boxes"])]
+                curr_text_features = text_features[i]
+                
+                # Get and reorder positive map
+                curr_positive_map = targets[i]['positive_map'][gt_box_indices]
+                
+                # Compute grounding scores
+                curr_grounding_scores = torch.matmul(
+                    curr_grounding_features,
+                    curr_text_features.transpose(0, 1)
+                )
+                
+                # Compute loss
+                curr_loss = self.token_loss(
+                    curr_grounding_scores.unsqueeze(0),
+                    curr_positive_map.unsqueeze(0),
+                    text_masks=language_dict.get('masks')[i:i+1] if language_dict.get('masks') is not None else None
+                )
+                batch_losses.append(curr_loss)
+                
+                start_idx += len(targets[i]["boxes"])
 
-            positive_maps = torch.cat([t['positive_map'] for t in targets], dim=0) 
-            
-            # Compute grounding loss
-            grounding_loss = self.token_loss(
-                grounding_scores,
-                positive_maps,
-                text_masks=language_dict.get('masks')
-            )
-            
+            grounding_loss = torch.stack(batch_losses).mean()
             # Combine all losses
             losses = {}
             losses.update(rpn_losses)

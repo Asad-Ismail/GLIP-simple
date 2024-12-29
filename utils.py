@@ -8,7 +8,11 @@ import torchvision.transforms.functional as F
 import torchvision
 from typing import List, Optional
 from torch import Tensor
-
+from typing import List, Dict, Tuple
+import math
+from bounding_box import BoxList
+import numpy as np
+import cv2
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):
     """construct a map such that positive_map[i,j] = True iff box i is associated to token j
@@ -122,81 +126,93 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
 
 
-def crop(image, target, region):
-    cropped_image = F.crop(image, *region)
+def matrix_iou(a, b, relative=False):
+    """
+    return iou of a and b, numpy version for data augenmentation
+    """
+    lt = np.maximum(a[:, np.newaxis, :2], b[:, :2])
+    rb = np.minimum(a[:, np.newaxis, 2:], b[:, 2:])
 
-    target = target.copy()
-    i, j, h, w = region
-
-    # should we do something wrt the original size?
-    target["size"] = torch.tensor([h, w])
-
-    fields = ["labels", "area", "iscrowd", "positive_map"]
-
-    if "boxes" in target:
-        boxes = target["boxes"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
-        cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
-        target["boxes"] = cropped_boxes.reshape(-1, 4)
-        target["area"] = area
-        fields.append("boxes")
-
-    if "masks" in target:
-        # FIXME should we update the area here if there are no boxes?
-        target["masks"] = target["masks"][:, i : i + h, j : j + w]
-        fields.append("masks")
-
-    # remove elements for which the boxes or masks that have zero area
-    if "boxes" in target or "masks" in target:
-        # favor boxes selection when defining which elements to keep
-        # this is compatible with previous implementation
-        if "boxes" in target:
-            cropped_boxes = target["boxes"].reshape(-1, 2, 2)
-            keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
-        else:
-            keep = target["masks"].flatten(1).any(1)
-
-        for field in fields:
-            if field in target:
-                target[field] = target[field][keep]
-
-    if os.environ.get("IPDB_SHILONG_DEBUG", None) == "INFO":
-        # for debug and visualization only.
-        if "strings_positive" in target:
-            target["strings_positive"] = [
-                _i for _i, _j in zip(target["strings_positive"], keep) if _j
-            ]
-
-    return cropped_image, target
+    area_i = np.prod(rb - lt, axis=2) * (lt < rb).all(axis=2)
+    area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
+    area_b = np.prod(b[:, 2:] - b[:, :2], axis=1)
+    if relative:
+        ious = area_i / (area_b[:, np.newaxis]+1e-12)
+    else:
+        ious = area_i / (area_a[:, np.newaxis] + area_b - area_i+1e-12)
+    return ious
 
 
-def hflip(image, target):
-    flipped_image = F.hflip(image)
+class RACompose(object):
+    def __init__(self, pre_transforms, rand_transforms, post_transforms, concurrent=2):
+        self.preprocess = pre_transforms
+        self.transforms = post_transforms
+        self.rand_transforms = rand_transforms
+        self.concurrent = concurrent
 
-    w, h = image.size
+    def __call__(self, image, target):
+        for t in self.preprocess:
+            image, target = t(image, target)
+        for t in random.choices(self.rand_transforms, k=self.concurrent):
+            image = np.array(image)
+            image, target = t(image, target)
+        for t in self.transforms:
+            image, target = t(image, target)
 
-    target = target.copy()
-    if "boxes" in target:
-        boxes = target["boxes"]
-        boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor(
-            [w, 0, w, 0]
-        )
-        target["boxes"] = boxes
+        return image, target
 
-    if "masks" in target:
-        target["masks"] = target["masks"].flip(-1)
+    def __repr__(self):
+        format_string = self.__class__.__name__ + "("
+        for t in self.preprocess:
+            format_string += "\n"
+            format_string += "    {0}".format(t)
+        format_string += "\nRandom select {0} from: (".format(self.concurrent)
+        for t in self.rand_transforms:
+            format_string += "\n"
+            format_string += "    {0}".format(t)
+        format_string += ")\nThen, apply:"
+        for t in self.transforms:
+            format_string += "\n"
+            format_string += "    {0}".format(t)
+        format_string += "\n)"
+        return format_string
 
-    return flipped_image, target
+
+class Compose(object):
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, image, target=None):
+        for t in self.transforms:
+            image, target = t(image, target)
+        if target is None:
+            return image
+        return image, target
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + "("
+        for t in self.transforms:
+            format_string += "\n"
+            format_string += "    {0}".format(t)
+        format_string += "\n)"
+        return format_string
 
 
-def resize(image, target, size, max_size=None):
-    # size can be min_size (scalar) or (w, h) tuple
+class Resize(object):
+    def __init__(self, min_size, max_size, restrict=False):
+        if not isinstance(min_size, (list, tuple)):
+            min_size = (min_size,)
+        self.min_size = min_size
+        self.max_size = max_size
+        self.restrict = restrict
 
-    def get_size_with_aspect_ratio(image_size, size, max_size=None):
+    # modified from torchvision to add support for max size
+    def get_size(self, image_size):
         w, h = image_size
+        size = random.choice(self.min_size)
+        max_size = self.max_size
+        if self.restrict:
+            return (size, max_size)
         if max_size is not None:
             min_original_size = float(min((w, h)))
             max_original_size = float(max((w, h)))
@@ -215,209 +231,276 @@ def resize(image, target, size, max_size=None):
 
         return (oh, ow)
 
-    def get_size(image_size, size, max_size=None):
-        if isinstance(size, (list, tuple)):
-            return size[::-1]
+    def __call__(self, image, target):
+        if isinstance(image, np.ndarray):
+            image_size = self.get_size(image.shape[:2])
+            image = cv2.resize(image, image_size)
+            new_size = image_size
         else:
-            return get_size_with_aspect_ratio(image_size, size, max_size)
-
-    size = get_size(image.size, size, max_size)
-    rescaled_image = F.resize(image, size)
-
-    if target is None:
-        return rescaled_image, None
-
-    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
-    ratio_width, ratio_height = ratios
-
-    target = target.copy()
-    if "boxes" in target:
-        boxes = target["boxes"]
-        scaled_boxes = boxes * torch.as_tensor(
-            [ratio_width, ratio_height, ratio_width, ratio_height]
-        )
-        target["boxes"] = scaled_boxes
-
-    if "area" in target:
-        area = target["area"]
-        scaled_area = area * (ratio_width * ratio_height)
-        target["area"] = scaled_area
-
-    h, w = size
-    target["size"] = torch.tensor([h, w])
-
-    if "masks" in target:
-        target["masks"] = (
-            interpolate(target["masks"][:, None].float(), size, mode="nearest")[:, 0] > 0.5
-        )
-
-    return rescaled_image, target
-
-
-def pad(image, target, padding):
-    # assumes that we only pad on the bottom right corners
-    padded_image = F.pad(image, (0, 0, padding[0], padding[1]))
-    if target is None:
-        return padded_image, None
-    target = target.copy()
-    # should we do something wrt the original size?
-    target["size"] = torch.tensor(padded_image.size[::-1])
-    if "masks" in target:
-        target["masks"] = torch.nn.functional.pad(target["masks"], (0, padding[0], 0, padding[1]))
-    return padded_image, target
-
-
-class ResizeDebug(object):
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img, target):
-        return resize(img, target, self.size)
-
-
-class RandomCrop(object):
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img, target):
-        region = T.RandomCrop.get_params(img, self.size)
-        return crop(img, target, region)
-
-
-class RandomSizeCrop(object):
-    def __init__(self, min_size: int, max_size: int, respect_boxes: bool = False):
-        # respect_boxes:    True to keep all boxes
-        #                   False to tolerence box filter
-        self.min_size = min_size
-        self.max_size = max_size
-        self.respect_boxes = respect_boxes
-
-    def __call__(self, img: PIL.Image.Image, target: dict):
-        init_boxes = len(target["boxes"])
-        max_patience = 10
-        for i in range(max_patience):
-            w = random.randint(self.min_size, min(img.width, self.max_size))
-            h = random.randint(self.min_size, min(img.height, self.max_size))
-            region = T.RandomCrop.get_params(img, [h, w])
-            result_img, result_target = crop(img, target, region)
-            if (
-                not self.respect_boxes
-                or len(result_target["boxes"]) == init_boxes
-                or i == max_patience - 1
-            ):
-                return result_img, result_target
-        return result_img, result_target
-
-
-class CenterCrop(object):
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img, target):
-        image_width, image_height = img.size
-        crop_height, crop_width = self.size
-        crop_top = int(round((image_height - crop_height) / 2.0))
-        crop_left = int(round((image_width - crop_width) / 2.0))
-        return crop(img, target, (crop_top, crop_left, crop_height, crop_width))
+            image = F.resize(image, self.get_size(image.size))
+            new_size = image.size
+        if target is not None:
+            target = target.resize(new_size)
+        return image, target
 
 
 class RandomHorizontalFlip(object):
-    def __init__(self, p=0.5):
-        self.p = p
+    def __init__(self, prob=0.5):
+        self.prob = prob
 
-    def __call__(self, img, target):
-        if random.random() < self.p:
-            return hflip(img, target)
-        return img, target
-
-
-class RandomResize(object):
-    def __init__(self, sizes, max_size=None):
-        assert isinstance(sizes, (list, tuple))
-        self.sizes = sizes
-        self.max_size = max_size
-
-    def __call__(self, img, target=None):
-        size = random.choice(self.sizes)
-        return resize(img, target, size, self.max_size)
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            if isinstance(image, np.ndarray):
+                image = np.fliplr(image)
+            else:
+                image = F.hflip(image)
+            if target is not None:
+                target = target.transpose(0)
+        return image, target
 
 
-class RandomPad(object):
-    def __init__(self, max_pad):
-        self.max_pad = max_pad
+class RandomVerticalFlip(object):
+    def __init__(self, prob=0.5):
+        self.prob = prob
 
-    def __call__(self, img, target):
-        pad_x = random.randint(0, self.max_pad)
-        pad_y = random.randint(0, self.max_pad)
-        return pad(img, target, (pad_x, pad_y))
-
-
-class RandomSelect(object):
-    """
-    Randomly selects between transforms1 and transforms2,
-    with probability p for transforms1 and (1 - p) for transforms2
-    """
-
-    def __init__(self, transforms1, transforms2, p=0.5):
-        self.transforms1 = transforms1
-        self.transforms2 = transforms2
-        self.p = p
-
-    def __call__(self, img, target):
-        if random.random() < self.p:
-            return self.transforms1(img, target)
-        return self.transforms2(img, target)
-
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            if isinstance(image, np.ndarray):
+                image = np.flipud(image)
+            else:
+                image = F.vflip(image)
+            target = target.transpose(1)
+        return image, target
 
 class ToTensor(object):
-    def __call__(self, img, target):
-        return F.to_tensor(img), target
-
-
-class RandomErasing(object):
-    def __init__(self, *args, **kwargs):
-        self.eraser = T.RandomErasing(*args, **kwargs)
-
-    def __call__(self, img, target):
-        return self.eraser(img), target
+    def __call__(self, image, target):
+        return F.to_tensor(image), target
 
 
 class Normalize(object):
-    def __init__(self, mean, std):
+    def __init__(self, mean, std, format='rgb'):
         self.mean = mean
         self.std = std
-
-    def __call__(self, image, target=None):
-        image = F.normalize(image, mean=self.mean, std=self.std)
-        if target is None:
-            return image, None
-        # Donot modfy boxes because RPN from torchvision requires boxes in x1,x2,y1,y2 without noramlization
-        #target = target.copy()
-        #h, w = image.shape[-2:]
-        #if "boxes" in target:
-        #    boxes = target["boxes"]
-        #    boxes = box_xyxy_to_cxcywh(boxes)
-        #    boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
-        #    target["boxes"] = boxes
-        return image, target
-
-
-class Compose(object):
-    def __init__(self, transforms):
-        self.transforms = transforms
+        self.format = format.lower()
 
     def __call__(self, image, target):
-        for t in self.transforms:
-            image, target = t(image, target)
+        if 'bgr' in self.format:
+            image = image[[2, 1, 0]]
+        if '255' in self.format:
+            image = image * 255
+        image = F.normalize(image, mean=self.mean, std=self.std)
         return image, target
 
-    def __repr__(self):
-        format_string = self.__class__.__name__ + "("
-        for t in self.transforms:
-            format_string += "\n"
-            format_string += "    {0}".format(t)
-        format_string += "\n)"
-        return format_string
+
+class ColorJitter(object):
+    def __init__(self,
+                 brightness=0.0,
+                 contrast=0.0,
+                 saturation=0.0,
+                 hue=0.0,
+                 ):
+        self.color_jitter = torchvision.transforms.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,)
+
+    def __call__(self, image, target):
+        image = self.color_jitter(image)
+        return image, target
+
+
+class RandomCrop(object):
+    def __init__(self, prob=0.5, min_ious=(0.1, 0.3, 0.5, 0.7, 0.9), min_crop_size=0.3):
+        # 1: return ori img
+        self.prob = prob
+        self.sample_mode = (1, *min_ious, 0)
+        self.min_crop_size = min_crop_size
+
+    def __call__(self, img, target):
+        if random.random() > self.prob:
+            return img, target
+
+        h, w, c = img.shape
+        boxes = target.bbox.numpy()
+        labels = target.get_field('labels')
+
+        while True:
+            mode = random.choice(self.sample_mode)
+            if mode == 1:
+                return img, target
+
+            min_iou = mode
+
+            new_w = random.uniform(self.min_crop_size * w, w)
+            new_h = random.uniform(self.min_crop_size * h, h)
+
+            # h / w in [0.5, 2]
+            if new_h / new_w < 0.5 or new_h / new_w > 2:
+                continue
+
+            left = random.uniform(0, w - new_w)
+            top = random.uniform(0, h - new_h)
+
+            patch = np.array([left, top, left + new_w, top + new_h])
+            overlaps = matrix_iou(patch.reshape(-1, 4), boxes.reshape(-1, 4)).reshape(-1)
+            if overlaps.min() < min_iou:
+                continue
+
+            # center of boxes should inside the crop img
+            center = (boxes[:, :2] + boxes[:, 2:]) / 2
+            mask = (center[:, 0] > patch[0]) * (center[:, 1] > patch[1]) * (center[:, 0] < patch[2]) * ( center[:, 1] < patch[3])
+            if not mask.any():
+                continue
+
+            boxes = boxes[mask]
+            labels = labels[mask]
+
+            # adjust boxes
+            img = img[int(patch[1]):int(patch[3]), int(patch[0]):int(patch[2])]
+
+            boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
+            boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
+            boxes -= np.tile(patch[:2], 2)
+
+            new_target = BoxList(boxes, (img.shape[1], img.shape[0]), mode='xyxy')
+            new_target.add_field('labels', labels)
+            return img, new_target
+
+
+class RandomAffine(object):
+    def __init__(self, prob=0.5, degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-2, 2),
+                 borderValue=(127.5, 127.5, 127.5)):
+        self.prob = prob
+        self.degrees = degrees
+        self.translate = translate
+        self.scale = scale
+        self.shear = shear
+        self.borderValue = borderValue
+
+    def __call__(self, img, targets=None):
+        if random.random() > self.prob:
+            return img, targets
+        # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
+        # https://medium.com/uruvideo/dataset-augmentation-with-random-homographies-a8f4b44830d4
+
+        border = 0  # width of added border (optional)
+        #height = max(img.shape[0], img.shape[1]) + border * 2
+        height, width, _ = img.shape
+        bbox = targets.bbox
+
+        # Rotation and Scale
+        R = np.eye(3)
+        a = random.random() * (self.degrees[1] - self.degrees[0]) + self.degrees[0]
+        # a += random.choice([-180, -90, 0, 90])  # 90deg rotations added to small rotations
+        s = random.random() * (self.scale[1] - self.scale[0]) + self.scale[0]
+        R[:2] = cv2.getRotationMatrix2D(angle=a, center=(img.shape[1] / 2, img.shape[0] / 2), scale=s)
+
+        # Translation
+        T = np.eye(3)
+        T[0, 2] = (random.random() * 2 - 1) * self.translate[0] * img.shape[0] + border  # x translation (pixels)
+        T[1, 2] = (random.random() * 2 - 1) * self.translate[1] * img.shape[1] + border  # y translation (pixels)
+
+        # Shear
+        S = np.eye(3)
+        S[0, 1] = math.tan((random.random() * (self.shear[1] - self.shear[0]) + self.shear[0]) * math.pi / 180)  # x shear (deg)
+        S[1, 0] = math.tan((random.random() * (self.shear[1] - self.shear[0]) + self.shear[0]) * math.pi / 180)  # y shear (deg)
+
+        M = S @ T @ R  # Combined rotation matrix. ORDER IS IMPORTANT HERE!!
+        imw = cv2.warpPerspective(img, M, dsize=(width, height), flags=cv2.INTER_LINEAR,
+                                  borderValue=self.borderValue)  # BGR order borderValue
+
+        # Return warped points also
+        if targets:
+            n = bbox.shape[0]
+            points = bbox[:, 0:4]
+            area0 = (points[:, 2] - points[:, 0]) * (points[:, 3] - points[:, 1])
+
+            # warp points
+            xy = np.ones((n * 4, 3))
+            xy[:, :2] = points[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+            xy = (xy @ M.T)[:, :2].reshape(n, 8)
+
+            # create new boxes
+            x = xy[:, [0, 2, 4, 6]]
+            y = xy[:, [1, 3, 5, 7]]
+            xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+            # apply angle-based reduction
+            radians = a * math.pi / 180
+            reduction = max(abs(math.sin(radians)), abs(math.cos(radians))) ** 0.5
+            x = (xy[:, 2] + xy[:, 0]) / 2
+            y = (xy[:, 3] + xy[:, 1]) / 2
+            w = (xy[:, 2] - xy[:, 0]) * reduction
+            h = (xy[:, 3] - xy[:, 1]) * reduction
+            xy = np.concatenate((x - w / 2, y - h / 2, x + w / 2, y + h / 2)).reshape(4, n).T
+
+            # reject warped points outside of image
+            x1 = np.clip(xy[:,0], 0, width)
+            y1 = np.clip(xy[:,1], 0, height)
+            x2 = np.clip(xy[:,2], 0, width)
+            y2 = np.clip(xy[:,3], 0, height)
+            new_bbox = np.concatenate((x1, y1, x2, y2)).reshape(4, n).T
+            targets.bbox = torch.as_tensor(new_bbox, dtype=torch.float32)
+
+        return imw, targets
+
+
+class RandomErasing:
+    def __init__(self, prob=0.5, era_l=0.02, era_h=1/3, min_aspect=0.3,
+                 mode='const', max_count=1, max_overlap=0.3, max_value=255):
+        self.prob = prob
+        self.era_l = era_l
+        self.era_h = era_h
+        self.min_aspect = min_aspect
+        self.min_count = 1
+        self.max_count = max_count
+        self.max_overlap = max_overlap
+        self.max_value = max_value
+        self.mode = mode.lower()
+        assert self.mode in ['const', 'rand', 'pixel'], 'invalid erase mode: %s' % self.mode
+
+    def _get_pixels(self, patch_size):
+        if self.mode == 'pixel':
+            return np.random.random(patch_size)*self.max_value
+        elif self.mode == 'rand':
+            return np.random.random((1, 1, patch_size[-1]))*self.max_value
+        else:
+            return np.zeros((1, 1, patch_size[-1]))
+
+    def __call__(self, image, target):
+        if random.random() > self.prob:
+            return image, target
+        ih, iw, ic = image.shape
+        ia = ih * iw
+        count = self.min_count if self.min_count == self.max_count else \
+            random.randint(self.min_count, self.max_count)
+        erase_boxes = []
+        for _ in range(count):
+            for try_idx in range(10):
+                erase_area = random.uniform(self.era_l, self.era_h) * ia / count
+                aspect_ratio = math.exp(random.uniform(math.log(self.min_aspect), math.log(1/self.min_aspect)))
+                eh = int(round(math.sqrt(erase_area * aspect_ratio)))
+                ew = int(round(math.sqrt(erase_area / aspect_ratio)))
+                if eh < ih and ew < iw:
+                    x = random.randint(0, iw - ew)
+                    y = random.randint(0, ih - eh)
+                    image[y:y+eh, x:x+ew, :] = self._get_pixels((eh, ew, ic))
+                    erase_boxes.append([x,y,x+ew,y+eh])
+                break
+
+        if target is not None and len(erase_boxes)>0:
+            boxes = target.bbox.numpy()
+            labels = target.get_field('labels')
+            overlap = matrix_iou(np.array(erase_boxes), boxes, relative=True)
+            mask = overlap.max(axis=0)<self.max_overlap
+            boxes = boxes[mask]
+            labels = labels[mask]
+            target.bbox = torch.as_tensor(boxes, dtype=torch.float32)
+            target.add_field('labels', labels)
+
+        return image, target
+
        
 class NestedTensor(object):
     def __init__(self, tensors, mask: Optional[Tensor]):
@@ -669,3 +752,70 @@ def prepare_batch(batch, device):
                 target[k] = v.to(device)
     
     return images, targets, original_sizes, captions
+
+
+
+def cat(tensors, dim=0):
+    """
+    Efficient version of torch.cat that avoids a copy if there is only a single element in a list
+    """
+    assert isinstance(tensors, (list, tuple))
+    if len(tensors) == 1:
+        return tensors[0]
+    return torch.cat(tensors, dim)
+
+
+def permute_and_flatten(layer, N, A, C, H, W):
+    layer = layer.view(N, -1, C, H, W)
+    layer = layer.permute(0, 3, 4, 1, 2)
+    layer = layer.reshape(N, -1, C)
+    return layer
+
+
+def concat_box_prediction_layers(box_regression, box_cls=None, token_logits=None):
+    box_regression_flattened = []
+    box_cls_flattened = []
+    token_logit_flattened = []
+
+    # for each feature level, permute the outputs to make them be in the
+    # same format as the labels. Note that the labels are computed for
+    # all feature levels concatenated, so we keep the same representation
+    # for the objectness and the box_regression
+    for box_cls_per_level, box_regression_per_level in zip(
+            box_cls, box_regression
+    ):
+        N, AxC, H, W = box_cls_per_level.shape
+        Ax4 = box_regression_per_level.shape[1]
+        A = Ax4 // 4
+        C = AxC // A
+        box_cls_per_level = permute_and_flatten(
+            box_cls_per_level, N, A, C, H, W
+        )
+        box_cls_flattened.append(box_cls_per_level)
+
+        box_regression_per_level = permute_and_flatten(
+            box_regression_per_level, N, A, 4, H, W
+        )
+        box_regression_flattened.append(box_regression_per_level)
+
+    if token_logits is not None:
+        for token_logit_per_level in token_logits:
+            N, AXT, H, W = token_logit_per_level.shape
+            T = AXT // A
+            token_logit_per_level = permute_and_flatten(
+                token_logit_per_level, N, A, T, H, W
+            )
+            token_logit_flattened.append(token_logit_per_level)
+
+    # concatenate on the first dimension (representing the feature levels), to
+    # take into account the way the labels were generated (with all feature maps
+    # being concatenated as well)
+    box_cls = cat(box_cls_flattened, dim=1).reshape(-1, C)
+    box_regression = cat(box_regression_flattened, dim=1).reshape(-1, 4)
+
+    token_logits_stacked = None
+    if token_logits is not None:
+        # stacked
+        token_logits_stacked = cat(token_logit_flattened, dim=1)
+
+    return box_regression, box_cls, token_logits_stacked

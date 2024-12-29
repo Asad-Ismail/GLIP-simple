@@ -1,12 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertModel, BertTokenizer,BertTokenizerFast
+from transformers import BertModel,BertTokenizerFast
 from torchvision.ops import generalized_box_iou_loss
-import timm
 from typing import OrderedDict
 from torchvision.models import swin_b
-import math
 
 
 class GLIPBackbone(nn.Module):
@@ -45,8 +43,7 @@ class GLIPBackbone(nn.Module):
         feature_masks = {}
         
         x = tensors
-        
-        # Process through features layer by layer
+
         for i, layer in enumerate(self.features):
             x = layer(x)
             
@@ -59,24 +56,24 @@ class GLIPBackbone(nn.Module):
                 
                 # Project to common dimension
                 feat = self.feature_proj[level](feat)
-               
+            
                 # Get mask for this level
                 feat_mask = F.interpolate(valid_mask[None].float(), 
                                         size=feat.shape[-2:],
                                         mode='nearest').bool()[0]
                 
                 # Store features and mask
-                features[level] = feat * feat_mask.unsqueeze(1).float()
+                features[level] = feat * feat_mask.unsqueeze(1)
                 feature_masks[level] = feat_mask
         
         # Add P5
         p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
         p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
-                              size=p5.shape[-2:],
-                              mode='nearest')[0].bool()
-        features['p5'] = p5 * p5_mask.unsqueeze(1).float()
+                            size=p5.shape[-2:],
+                            mode='nearest')[0].bool()
+        features['p5'] = p5 * p5_mask.unsqueeze(1)
         feature_masks['p5'] = p5_mask
-        
+            
         return features, feature_masks
 
     def get_text_features(self, captions, device):
@@ -127,7 +124,7 @@ class GLIPBackbone(nn.Module):
         }
 
 class VLDyHead(nn.Module):
-    def __init__(self, num_convs=8, hidden_dim=256, in_channels=256):
+    def __init__(self, num_convs=4, hidden_dim=256, in_channels=256):
         super().__init__()
         
         # Build tower layers
@@ -152,11 +149,7 @@ class VLDyHead(nn.Module):
             )
         
         self.dyhead_tower = nn.Sequential(*dyhead_tower)
-        # Final projection for language features from 768 to 256
-        self.final_lang_proj = nn.Sequential(
-            nn.Linear(768, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
+
         
     def forward(self, features):
         """
@@ -166,7 +159,6 @@ class VLDyHead(nn.Module):
                 - lang: dict with 'hidden' and 'masks' 
         """
         x=self.dyhead_tower(features)
-        x["lang"]["hidden"] = self.final_lang_proj(x["lang"]["hidden"])
         return x
 
 class BiMultiHeadAttention(nn.Module):
@@ -220,12 +212,12 @@ class BiMultiHeadAttention(nn.Module):
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
         # Clamping is important for stability and OOO CUDA ERROR
-        attn_weights = torch.clamp(torch.clamp(attn_weights, min=-50000), max=50000)
+        attn_weights.clamp_(min=-50000, max=50000)
 
         attn_weights_T = attn_weights.transpose(1, 2)
         attn_weights_l = (attn_weights_T - torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
          # Clamping is important for stability and OOO CUDA ERROR
-        attn_weights_l = torch.clamp(torch.clamp(attn_weights_l, min=-50000), max=50000)
+        attn_weights_l.clamp_(min=-50000, max=50000)
         attn_weights_l = attn_weights_l.softmax(dim=-1)
 
         if attention_mask_l is not None:
@@ -242,7 +234,7 @@ class BiMultiHeadAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
 
-        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1).half()
 
         attn_probs_v = F.dropout(attn_weights_v, p=self.dropout, training=self.training)
         attn_probs_l = F.dropout(attn_weights_l, p=self.dropout, training=self.training)
@@ -502,177 +494,4 @@ class DyConv(nn.Module):
             "lang": lang_dict              # Pass through
         }
 
-class Scale(nn.Module):
-    def __init__(self, init_value=1.0):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor([init_value], dtype=torch.float32))
-        
-    def forward(self, x):
-        return x * self.scale
     
-
-def token_sigmoid_binary_focal_loss(pred_logits, targets, alpha, gamma, text_mask=None):
-    # binary version of focal loss
-    # copied from https://github.com/facebookresearch/fvcore/blob/master/fvcore/nn/focal_loss.py
-    """
-    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-        alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
-        gamma: Exponent of the modulating factor (1 - p_t) to
-               balance easy vs hard examples.
-    Returns:
-        Loss tensor with the reduction option applied.
-    """
-    assert (targets.dim() == 3)
-    assert (pred_logits.dim() == 3)  # batch x from x to
-
-    bs, n, _ = pred_logits.shape
-    if text_mask is not None:
-        assert (text_mask.dim() == 2)
-        text_mask = (text_mask > 0).unsqueeze(1)
-        text_mask = text_mask.repeat(1, pred_logits.size(1), 1)  # copy along the image channel dimension
-        pred_logits = torch.masked_select(pred_logits, text_mask)
-        targets = torch.masked_select(targets, text_mask)
-
-        # print(pred_logits.shape)
-        # print(targets.shape)
-
-    p = torch.sigmoid(pred_logits)
-    ce_loss = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction="none")
-    p_t = p * targets + (1 - p) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
-
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
-
-    return loss
-
-class TokenSigmoidFocalLoss(nn.Module):
-
-    def __init__(self, alpha, gamma):
-        super(TokenSigmoidFocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, logits, targets, text_masks=None, version="binary", **kwargs):
-        if version == "binary":
-            loss_func = token_sigmoid_binary_focal_loss
-        else:
-            raise NotImplementedError
-        loss = loss_func(logits, targets, self.alpha, self.gamma, text_masks)
-        return loss.sum()
-
-    def repr(self):
-        tmpstr =  "("
-        tmpstr += "gamma=" + str(self.gamma)
-        tmpstr += ", alpha=" + str(self.alpha)
-        tmpstr += ")"
-        return tmpstr
-        
-        
-class GLIPHead(nn.Module):
-    """GLIP detection and grounding head with anchor-free detection"""
-    def __init__(self, hidden_dim=256, num_classes=80):
-        super().__init__()
-        
-        # Detection heads
-        self.bbox_head = nn.Conv2d(hidden_dim, 4, 3, padding=1)  # Box regression
-        self.center_head = nn.Conv2d(hidden_dim, 1, 3, padding=1)  # Centerness
-        
-        # Grounding heads
-        self.dot_product_projection_image = nn.Identity()
-        self.dot_product_projection_text = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Parameters for stability
-        self.log_scale = nn.Parameter(torch.Tensor([1.0]))
-        self.bias_lang = nn.Parameter(torch.zeros(hidden_dim))
-        self.bias0 = nn.Parameter(torch.Tensor([-2.0]))  # Initial bias for better convergence
-
-        # Loss functions
-        self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)
-        
-    def forward(self, features, language_dict_features):
-        """
-        Args:
-            features: List of FPN features after fusion
-            language_dict_features: Dict with text embeddings and masks
-        """
-        batch_size = features[0].shape[0]
-        
-        # Get language embeddings
-        text_embeds = language_dict_features['hidden']
-        text_masks = language_dict_features['masks']
-        
-        # Normalize language embeddings
-        text_embeds = F.normalize(text_embeds, p=2, dim=-1)
-        dot_product_proj_tokens = self.dot_product_projection_text(text_embeds / 2.0)
-        dot_product_proj_tokens_bias = torch.matmul(text_embeds, self.bias_lang) + self.bias0
-
-        predictions = []
-        for feat_level in features:
-            # Detection outputs
-            boxes = self.bbox_head(feat_level)
-            centers = self.center_head(feat_level)
-            
-            # Grounding outputs
-            B, C, H, W = feat_level.shape
-            img_embeds = self.dot_product_projection_image(feat_level)
-            img_embeds = img_embeds.view(B, C, -1).permute(0, 2, 1)  # [B, HW, C]
-            
-            # Compute grounding scores
-            img_embeds = F.normalize(img_embeds, p=2, dim=-1)
-            grounding_scores = torch.matmul(img_embeds, dot_product_proj_tokens.transpose(-1, -2))
-            grounding_scores = grounding_scores / self.log_scale.exp()
-            
-            # Add bias
-            bias = dot_product_proj_tokens_bias.unsqueeze(1).expand(-1, H*W, -1)
-            grounding_scores = grounding_scores + bias
-            
-            # Clamp for stability
-            grounding_scores = torch.clamp(grounding_scores, min=-50000, max=50000)
-            
-            predictions.append({
-                'boxes': boxes,
-                'centers': centers,
-                'grounding': grounding_scores,
-            })
-            
-        return predictions
-
-
-def compute_losses(predictions, targets, text_masks=None):
-    """Compute GLIP losses outside model forward pass"""
-    loss_bbox = 0
-    loss_centerness = 0 
-    loss_grounding = 0
-    
-    for pred_level, target_level in zip(predictions, targets):
-        # Box regression loss using GIoU
-        loss_bbox += generalized_box_iou_loss(
-            pred_level['boxes'],
-            target_level['boxes'],
-            reduction='mean'
-        )
-
-        
-        # Grounding loss using token focal loss
-        loss_grounding += token_sigmoid_binary_focal_loss(
-            pred_level['grounding'],
-            target_level['positive_map'],
-            alpha=0.25,
-            gamma=2.0,
-            text_mask=text_masks
-        )
-    
-    return {
-        'loss_bbox': loss_bbox,
-        'loss_grounding': loss_grounding
-    }
-
