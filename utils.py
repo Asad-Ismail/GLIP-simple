@@ -13,6 +13,7 @@ import math
 from bounding_box import BoxList
 import numpy as np
 import cv2
+from bounding_box import BoxList
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):
     """construct a map such that positive_map[i,j] = True iff box i is associated to token j
@@ -750,6 +751,9 @@ def prepare_batch(batch, device):
         for k, v in target.items():
             if isinstance(v, torch.Tensor):
                 target[k] = v.to(device)
+            if isinstance(v, BoxList):
+                target[k] = v.to(device)
+    
     
     return images, targets, sizes, captions
 

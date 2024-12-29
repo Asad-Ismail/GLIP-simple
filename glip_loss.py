@@ -143,7 +143,9 @@ class GLIPLoss(nn.Module):
 
     def forward(self, logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions):
         # Pass only boxes for preparing targets
-        labels, reg_targets, token_labels = self.prepare_targets([item['boxes'] for item in targets], anchors, captions)
+        bx_tgts=[item['boxes'] for item in targets]
+        pov_mp=torch.cat([item['positive_map'] for item in targets],axis=0)
+        labels, reg_targets, token_labels = self.prepare_targets(bx_tgts, anchors, pov_mp)
 
         N = len(labels)
 
@@ -194,7 +196,7 @@ class GLIPLoss(nn.Module):
         
         return losses
 
-    def prepare_targets(self, targets, anchors, tokenized=None, positive_map=None, proj_tokens=None):
+    def prepare_targets(self, targets, anchors, positive_map=None):
         cls_labels = []
         reg_targets = []
         token_labels = []
@@ -216,7 +218,7 @@ class GLIPLoss(nn.Module):
 
 
             anchors_per_im = cat_boxlist(anchors[im_i])
-
+            # Anchor aspect ratio
             num_anchors_per_loc = len((1.0,)) 
             num_anchors_per_level = [len(anchors_per_level.bbox) for anchors_per_level in anchors[im_i]]
             ious = boxlist_iou(anchors_per_im, targets_per_im)
@@ -237,7 +239,7 @@ class GLIPLoss(nn.Module):
             for level, anchors_per_level in enumerate(anchors[im_i]):
                 end_idx = star_idx + num_anchors_per_level[level]
                 distances_per_level = distances[star_idx:end_idx, :]
-                topk = min(self.cfg.MODEL.ATSS.TOPK * num_anchors_per_loc, num_anchors_per_level[level])
+                topk = min(TOPK * num_anchors_per_loc, num_anchors_per_level[level])
                 _, topk_idxs_per_level = distances_per_level.topk(topk, dim=0, largest=False)
                 candidate_idxs.append(topk_idxs_per_level + star_idx)
                 star_idx = end_idx
@@ -296,7 +298,8 @@ class GLIPLoss(nn.Module):
             reg_targets.append(reg_targets_per_im)
 
             token_labels.append(token_labels_per_im)
-
+        
+        return  cls_labels,reg_targets,token_labels
 
     def focal_loss(self, inputs, targets):
         return sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='sum')
