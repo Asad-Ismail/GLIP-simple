@@ -12,7 +12,7 @@ INF = 1e8
 class BoxCoder(object):
 
     def __init__(self):
-        super.__init__()
+        super().__init__()
 
     def encode(self, gt_boxes, anchors):
         TO_REMOVE = 1  # TODO remove
@@ -135,9 +135,8 @@ class TokenSigmoidFocalLoss(nn.Module):
         
 
 class GLIPLoss(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self):
         super().__init__()
-        self.cfg = cfg
         self.box_coder = BoxCoder()
         self.centerness_loss_func = nn.BCEWithLogitsLoss(reduction="sum")
         self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)

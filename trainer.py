@@ -11,12 +11,14 @@ from transformers import BertTokenizer
 import os
 from utils import Resize,ToTensor,Normalize,Compose
 from utils import prepare_batch,convert_od_to_grounding_data
-from glip import GLIPBackbone,VLDyHead,compute_losses
+from glip import GLIPBackbone,VLDyHead
 #from head import GLIPHead
 from rpn_head import GLIPHead
 from anchor_generator import anchor_generator_simple
 from bounding_box import BoxList
 from glip_loss import GLIPLoss
+
+
 
 class COCOGLIPDataset(Dataset):
     def __init__(self, 
