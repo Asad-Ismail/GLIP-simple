@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from torchvision.ops.focal_loss import sigmoid_focal_loss
+import torch.nn.functional as F
 import math
 from utils import concat_box_prediction_layers
 from boxlist_ops import cat_boxlist
 from boxlist_ops import boxlist_iou
 
 INF = 1e8
+
 
 
 class BoxCoder(object):
@@ -132,7 +133,61 @@ class TokenSigmoidFocalLoss(nn.Module):
         tmpstr += ", alpha=" + str(self.alpha)
         tmpstr += ")"
         return tmpstr
-        
+
+
+def cls_sigmoid_focal_loss(logits, targets, gamma, alpha):
+    """
+    GPU-optimized focal loss implementation using PyTorch built-ins.
+    
+    Args:
+        logits (Tensor): Predicted logits with shape (N, num_classes).
+        targets (Tensor): Ground truth class indices with shape (N,).
+        gamma (float): Focusing parameter to balance easy vs. hard examples.
+        alpha (float): Weighting factor for positive vs. negative classes.
+
+    Returns:
+        Tensor: Focal loss per sample with shape (N,).
+    """
+    num_classes = logits.shape[1]
+    dtype = targets.dtype
+    device = logits.device
+
+    # Class range tensor
+    class_range = torch.arange(1, num_classes + 1, dtype=dtype, device=device).unsqueeze(0)
+
+    # Targets and probabilities
+    t = targets.unsqueeze(1)  # Shape: (N, 1)
+    p = torch.sigmoid(logits)  # Shape: (N, num_classes)
+
+    # Compute terms
+    term1 = (1 - p) ** gamma * torch.log(p + 1e-6)  # Avoid log(0)
+    term2 = p ** gamma * torch.log(1 - p + 1e-6)    # Avoid log(0)
+
+    # Focal loss components
+    pos_loss = -(t == class_range).float() * term1 * alpha
+    neg_loss = -((t != class_range) & (t >= 0)).float() * term2 * (1 - alpha)
+
+    return pos_loss + neg_loss
+
+class ClsSigmoidFocalLoss(nn.Module):
+    def __init__(self, gamma, alpha):
+        super(ClsSigmoidFocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        loss_func = cls_sigmoid_focal_loss
+        loss = loss_func(logits, targets, self.gamma, self.alpha)
+        return loss.sum()
+
+    def __repr__(self):
+        tmpstr = self.__class__.__name__ + "("
+        tmpstr += "gamma=" + str(self.gamma)
+        tmpstr += ", alpha=" + str(self.alpha)
+        tmpstr += ")"
+        return tmpstr
+
+
 
 class GLIPLoss(nn.Module):
     def __init__(self):
@@ -140,6 +195,7 @@ class GLIPLoss(nn.Module):
         self.box_coder = BoxCoder()
         self.centerness_loss_func = nn.BCEWithLogitsLoss(reduction="sum")
         self.token_loss = TokenSigmoidFocalLoss(alpha=0.25, gamma=2.0)
+        self.cls_loss=ClsSigmoidFocalLoss(alpha=0.25, gamma=2.0)
 
     def forward(self, logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions):
         # Pass only boxes for preparing targets
@@ -167,7 +223,11 @@ class GLIPLoss(nn.Module):
         pos_inds = torch.nonzero(labels_flatten > 0).squeeze(1)
 
 
-        cls_loss = self.focal_loss(box_cls_flatten, labels_flatten.int()) 
+        total_num_pos = pos_inds.numel()
+        num_pos_avg_per_gpu = max(total_num_pos, 1.0)
+        cls_loss = self.cls_loss(box_cls_flatten, labels_flatten.int()) /num_pos_avg_per_gpu
+
+        text_masks= torch.stack([item['attention_mask'] for item in targets],axis=0)
 
         dot_product_token_loss = self.token_loss(dot_product_logits,
                                                                 token_labels_stacked, text_masks=text_masks,
@@ -300,9 +360,6 @@ class GLIPLoss(nn.Module):
             token_labels.append(token_labels_per_im)
         
         return  cls_labels,reg_targets,token_labels
-
-    def focal_loss(self, inputs, targets):
-        return sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='sum')
 
 
     def GIoULoss(self, pred, target, anchor, weight=None):
