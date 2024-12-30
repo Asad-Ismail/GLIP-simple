@@ -15,6 +15,8 @@ from anchor_generator import anchor_generator_simple
 from bounding_box import BoxList
 from glip_loss import GLIPLoss
 from image_list import ImageList
+from box_coder import BoxCoder 
+from utils import Predictor
 
 
 import os
@@ -137,11 +139,14 @@ class GLIP(nn.Module):
         if num_classes is None:
             num_classes = 80  # COCO default
         
+
+        self.box_coder = BoxCoder()
         self.backbone = GLIPBackbone()
         self.dyhead = VLDyHead(hidden_dim=hidden_dim)
         self.anchor_generator=anchor_generator_simple()
         self.head = GLIPHead(in_channels=hidden_dim, num_classes=num_classes)
-        self.loss_calculator = GLIPLoss()
+        self.loss_calculator = GLIPLoss(self.box_coder)
+        self.predictor= Predictor(self.box_coder)
         
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
@@ -163,13 +168,17 @@ class GLIP(nn.Module):
         }
         
         logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
+
+        # Only size of these image list is used to create anchors TODO Change it allow anchor generator to also expect only sizes to generator anchors
+        images_list=ImageList(images.tensors,sizes)
+        anchors = self.anchor_generator(images_list, fused_features['visual'])
         
         if self.training and targets is not None:
-            # Only size of these image list is used to create anchors TODO Change it allow anchor generator to also expect only sizes to generator anchors
-            images_list=ImageList(images.tensors,sizes)
-            anchors = self.anchor_generator(images_list, fused_features['visual'])
             losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
             return losses
+        else:
+            # DO inference
+            
         
        
 

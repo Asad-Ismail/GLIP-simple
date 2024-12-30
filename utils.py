@@ -816,6 +816,14 @@ def concat_box_prediction_layers(box_regression, box_cls=None, token_logits=None
     return box_regression, box_cls, token_logits_stacked
 
 
+def aggregate_scores(token_probs,score_agg):
+    if score_agg == "MEAN":
+        return token_probs.mean(-1)
+    elif score_agg == "MAX":
+        # torch.max() returns (values, indices)
+        return token_probs.max(-1)[0]
+    else:
+        raise NotImplementedError
 
 class Predictor(torch.nn.Module):
     def __init__(
@@ -829,8 +837,6 @@ class Predictor(torch.nn.Module):
         self.nms_thresh = 0.6
         self.fpn_post_nms_top_n = 100
         self.min_size = 0
-        self.num_classes = 81
-        self.bbox_aug_enabled = False
         self.box_coder = box_coder
         self.score_agg = score_agg
 
@@ -840,7 +846,10 @@ class Predictor(torch.nn.Module):
 
         A = box_regression.size(1) // 4
 
-        scores = convert_grounding_to_od_logits(logits=dot_product_logits,score_agg=self.score_agg)
+        #Passing through sigmoid for dor product logits
+        dot_product_logits = dot_product_logits.sigmoid()
+
+        scores = aggregate_scores(logits=dot_product_logits,score_agg=self.score_agg)
 
         box_cls = scores
 
@@ -862,6 +871,7 @@ class Predictor(torch.nn.Module):
 
         for per_box_cls, per_box_regression, per_pre_nms_top_n, per_candidate_inds, per_anchors \
                 in zip(box_cls, box_regression, pre_nms_top_n, candidate_inds, anchors):
+
             per_box_cls = per_box_cls[per_candidate_inds]
 
             per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
@@ -870,8 +880,6 @@ class Predictor(torch.nn.Module):
 
             per_box_loc = per_candidate_nonzeros[:, 0]
             per_class = per_candidate_nonzeros[:, 1] + 1
-
-            # print(per_class)
 
             detections = self.box_coder.decode(
                 per_box_regression[per_box_loc, :].view(-1, 4),
