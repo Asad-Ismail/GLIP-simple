@@ -14,6 +14,7 @@ from bounding_box import BoxList
 import numpy as np
 import cv2
 from bounding_box import BoxList
+from boxlist_ops import cat_boxlist, boxlist_ml_nms, remove_small_boxes
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):
     """construct a map such that positive_map[i,j] = True iff box i is associated to token j
@@ -587,7 +588,6 @@ def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTen
         ).to(torch.int64)
         max_size.append(max_size_i)
     max_size = tuple(max_size)
-
     # work around for
     # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
     # m[: img.shape[1], :img.shape[2]] = False
@@ -598,11 +598,9 @@ def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTen
         padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
         padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
         padded_imgs.append(padded_img)
-
         m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
         padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
         padded_masks.append(padded_mask.to(torch.bool))
-
     tensor = torch.stack(padded_imgs)
     mask = torch.stack(padded_masks)
 
@@ -624,7 +622,6 @@ def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
             # nested_tensor_from_tensor_list() does not export well to ONNX
             # call _onnx_nested_tensor_from_tensor_list() instead
             return _onnx_nested_tensor_from_tensor_list(tensor_list)
-
         # TODO make it support different-sized images
         max_size = _max_by_axis([list(img.shape) for img in tensor_list])
         # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
@@ -727,7 +724,6 @@ def convert_od_to_grounding_data(target, tokenizer, ind_to_class, max_query_len=
         'caption': caption,
         'attention_mask': tokenized.attention_mask[0]
     })
-    
     return target
 
 def prepare_batch(batch, device):
@@ -753,10 +749,7 @@ def prepare_batch(batch, device):
                 target[k] = v.to(device)
             if isinstance(v, BoxList):
                 target[k] = v.to(device)
-    
-    
     return images, targets, sizes, captions
-
 
 
 def cat(tensors, dim=0):
@@ -785,9 +778,7 @@ def concat_box_prediction_layers(box_regression, box_cls=None, token_logits=None
     # same format as the labels. Note that the labels are computed for
     # all feature levels concatenated, so we keep the same representation
     # for the objectness and the box_regression
-    for box_cls_per_level, box_regression_per_level in zip(
-            box_cls, box_regression
-    ):
+    for box_cls_per_level, box_regression_per_level in zip(box_cls, box_regression):
         N, AxC, H, W = box_cls_per_level.shape
         Ax4 = box_regression_per_level.shape[1]
         A = Ax4 // 4
@@ -823,3 +814,110 @@ def concat_box_prediction_layers(box_regression, box_cls=None, token_logits=None
         token_logits_stacked = cat(token_logit_flattened, dim=1)
 
     return box_regression, box_cls, token_logits_stacked
+
+
+
+class Predictor(torch.nn.Module):
+    def __init__(
+            self,
+            box_coder,
+            score_agg='MEAN',
+    ):
+        super().__init__()
+        self.pre_nms_thresh = 0.05
+        self.pre_nms_top_n = 1000
+        self.nms_thresh = 0.6
+        self.fpn_post_nms_top_n = 100
+        self.min_size = 0
+        self.num_classes = 81
+        self.bbox_aug_enabled = False
+        self.box_coder = box_coder
+        self.score_agg = score_agg
+
+    def forward_for_single_feature_map(self, box_regression, centerness, anchors,dot_product_logits=None,positive_map=None,):
+
+        N, _, H, W = box_regression.shape
+
+        A = box_regression.size(1) // 4
+
+        scores = convert_grounding_to_od_logits(logits=dot_product_logits,score_agg=self.score_agg)
+
+        box_cls = scores
+
+        box_regression = permute_and_flatten(box_regression, N, A, 4, H, W)
+        box_regression = box_regression.reshape(N, -1, 4)
+
+        candidate_inds = box_cls > self.pre_nms_thresh
+        pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
+        pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_top_n)
+
+        centerness = permute_and_flatten(centerness, N, A, 1, H, W)
+        centerness = centerness.reshape(N, -1).sigmoid()
+
+        # multiply the classification scores with centerness scores
+
+        box_cls = box_cls * centerness[:, :, None]
+
+        results = []
+
+        for per_box_cls, per_box_regression, per_pre_nms_top_n, per_candidate_inds, per_anchors \
+                in zip(box_cls, box_regression, pre_nms_top_n, candidate_inds, anchors):
+            per_box_cls = per_box_cls[per_candidate_inds]
+
+            per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
+
+            per_candidate_nonzeros = per_candidate_inds.nonzero()[top_k_indices, :]
+
+            per_box_loc = per_candidate_nonzeros[:, 0]
+            per_class = per_candidate_nonzeros[:, 1] + 1
+
+            # print(per_class)
+
+            detections = self.box_coder.decode(
+                per_box_regression[per_box_loc, :].view(-1, 4),
+                per_anchors.bbox[per_box_loc, :].view(-1, 4)
+            )
+
+            boxlist = BoxList(detections, per_anchors.size, mode="xyxy")
+            boxlist.add_field("labels", per_class)
+            boxlist.add_field("scores", torch.sqrt(per_box_cls))
+            boxlist = boxlist.clip_to_image(remove_empty=False)
+            boxlist = remove_small_boxes(boxlist, self.min_size)
+            results.append(boxlist)
+
+        return results
+
+    def forward(self, box_regression, centerness, anchors,dot_product_logits=None,positive_map=None):
+        sampled_boxes = []
+        anchors = list(zip(*anchors))
+        for idx, (b, c, a) in enumerate(zip(box_regression, centerness, anchors)):
+            d = dot_product_logits[idx]
+            sampled_boxes.append(self.forward_for_single_feature_map(b, c, a, d, positive_map))
+
+        boxlists = list(zip(*sampled_boxes))
+        boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
+        boxlists = self.select_over_all_levels(boxlists)
+
+        return boxlists
+
+
+    def select_over_all_levels(self, boxlists):
+        num_images = len(boxlists)
+        results = []
+        for i in range(num_images):
+            # multiclass nms
+            result = boxlist_ml_nms(boxlists[i], self.nms_thresh)
+            number_of_detections = len(result)
+
+            # Limit to max_per_image detections **over all classes**
+            if number_of_detections > self.fpn_post_nms_top_n > 0:
+                cls_scores = result.get_field("scores")
+                image_thresh, _ = torch.kthvalue(
+                    cls_scores.cpu().float(),
+                    number_of_detections - self.fpn_post_nms_top_n + 1
+                )
+                keep = cls_scores >= image_thresh.item()
+                keep = torch.nonzero(keep).squeeze(1)
+                result = result[keep]
+            results.append(result)
+        return results

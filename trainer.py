@@ -17,6 +17,10 @@ from glip_loss import GLIPLoss
 from image_list import ImageList
 
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 
 class COCOGLIPDataset(Dataset):
     def __init__(self, 
@@ -219,7 +223,7 @@ def train_glip():
     train_loader = DataLoader(
         train_dataset,
         batch_size=2,
-        shuffle=True,
+        shuffle=False,
         num_workers=4,
         collate_fn=lambda x: tuple(zip(*x)),
         pin_memory=True
@@ -235,11 +239,11 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5) #weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4) #weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
     
     # Training loop
-    num_epochs = 100
+    num_epochs = 10000
     log_interval = 5  # Print stats every 100 batches
     #val_interval = 5    # Perform validation every 5 epochs
 
@@ -248,6 +252,8 @@ def train_glip():
         total_loss = 0
         
         for batch_idx, batch in enumerate(train_loader):
+            if batch_idx>2:
+                break
             # Move data to device and perform a training step
             batch_loss_dict = train_step(model, batch, optimizer, device)  # train_step returns a dict
             batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
