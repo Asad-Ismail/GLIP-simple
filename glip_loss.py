@@ -35,8 +35,13 @@ def token_sigmoid_binary_focal_loss(pred_logits, targets, alpha, gamma, text_mas
         text_mask = (text_mask > 0).unsqueeze(1)
         text_mask = text_mask.repeat(1, pred_logits.size(1), 1)  # copy along the image channel dimension
         pred_logits = torch.masked_select(pred_logits, text_mask)
+        #nonzero_rows = torch.any(targets[...,:-1] != 0, dim=-1)
+        #indices = nonzero_rows.nonzero().squeeze()
+        #print(f"Number of non-zero rows: {len(indices)}")
+        #print(f"Row indices: {indices.tolist()}")
+        #if len(indices) > 0:
+        #    print(f"Sample values from first nonzero row: {targets[0,18890,:]}")
         targets = torch.masked_select(targets, text_mask)
-
         # print(pred_logits.shape)
         # print(targets.shape)
 
@@ -125,7 +130,9 @@ class GLIPLoss(nn.Module):
         # Pass only boxes for preparing targets
         bx_tgts=[item['boxes'] for item in targets]
         pov_mp=torch.cat([item['positive_map'] for item in targets],axis=0)
+
         labels, reg_targets, token_labels = self.prepare_targets(bx_tgts, anchors, pov_mp)
+
 
         N = len(labels)
 

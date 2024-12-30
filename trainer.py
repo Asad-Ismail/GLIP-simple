@@ -82,11 +82,11 @@ class COCOGLIPDataset(Dataset):
         categories = []
         str_cls_lst = []
         for ann in annotations:
-            x1, y1, w_box, h_box = ann['bbox']
+            x, y, w_box, h_box = ann['bbox']
             # Convert to center format [cx,cy,w,h]
-            x2 = x1 + w_box
-            y2 = y1 + h_box
-            boxes.append([x1, y1, x2, y2])
+            w = w_box
+            h = h_box
+            boxes.append([x, y, w, h])
             categories.append(ann['category_id'])
             cat_name = self.coco.loadCats([ann['category_id']])[0]['name']
             str_cls_lst.append(cat_name)
@@ -232,7 +232,7 @@ def train_glip():
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=4,
         collate_fn=lambda x: tuple(zip(*x)),
@@ -249,7 +249,7 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4) #weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4) #weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
     
     # Training loop
@@ -259,13 +259,15 @@ def train_glip():
 
     for epoch in range(num_epochs):
         
-        for batch_idx,batch in enumerate(val_loader):
-            val_step(model, batch, device,epoch)
+        if epoch%500==0:
+            for batch_idx,batch in enumerate(val_loader):
+                val_step(model, batch, device,epoch)
+                break
 
         total_loss = 0
         for batch_idx, batch in enumerate(train_loader):
-            #if batch_idx>2:
-            #    break
+            if batch_idx>0:
+                break
             # Move data to device and perform a training step
             batch_loss_dict = train_step(model, batch, optimizer, device)  # train_step returns a dict
             batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
