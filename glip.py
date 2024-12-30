@@ -96,7 +96,7 @@ class GLIPBackbone(nn.Module):
         return {
             'hidden': text_outputs.last_hidden_state,
             'masks': tokens.attention_mask,
-            'input_ids': tokens.input_ids
+            'tokenized': tokens
         }
 
     def forward(self, images, sizes, captions):

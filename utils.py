@@ -837,10 +837,107 @@ class Predictor(torch.nn.Module):
         self.nms_thresh = 0.6
         self.fpn_post_nms_top_n = 100
         self.min_size = 0
+        self.text_threshold = 0.2
         self.box_coder = box_coder
         self.score_agg = score_agg
+        self.mean = torch.tensor([0.485, 0.456, 0.406])
+        self.std = torch.tensor([0.229, 0.224, 0.225])
 
-    def forward_for_single_feature_map(self, box_regression, centerness, anchors,dot_product_logits=None,positive_map=None,):
+    def denormalize_image(self, image):
+        """
+        Denormalize image tensor and convert to uint8 numpy array
+        Args:
+            image: Tensor [C,H,W] normalized with ImageNet stats
+        Returns:
+            numpy array [H,W,C] with values in [0,255]
+        """
+        # Move channels to end: [C,H,W] -> [H,W,C]
+        image = image.permute(1, 2, 0)
+        
+        # Denormalize
+        image = image * self.std + self.mean
+        
+        # Clip values to [0,1]
+        image = torch.clamp(image, 0, 1)
+        
+        # Convert to uint8
+        image = (image * 255).cpu().numpy().astype(np.uint8)
+        
+        return image
+    
+    def visualize_predictions(self, image_tensor, boxlist, target, image_id, epoch,tokenizer,tokenized):
+        """
+        Visualize both predictions and ground truth
+        Args:
+            image_tensor: Normalized image tensor [C,H,W]
+            boxlist: Predicted BoxList with fields 'boxes', 'scores', 'phrases'
+            target: Ground truth with fields 'boxes', 'str_cls_lst'
+            image_id: Image identifier
+            epoch: Current epoch number
+        """
+        save_dir = os.path.join(self.save_dir, f'epoch_{epoch}')
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Denormalize image
+        image = self.denormalize_image(image_tensor)
+        
+        # Convert RGB to BGR for OpenCV
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        
+        
+        # Draw predictions
+        if len(boxlist) > 0:
+            pred_boxes = boxlist.bbox.cpu().numpy()
+            pred_detections = sv.Detections(xyxy=pred_boxes)
+            pred_phrases = boxlist.get_field("phrases") if boxlist.has_field("phrases") else None
+            image_bgr = self.pred_annotator.annotate(
+                scene=image_bgr.copy(),
+                detections=pred_detections,
+                labels=pred_phrases
+            )
+        
+        # Draw ground truth - extract phrases from target logits
+        if target is not None and len(target["boxes"]) > 0:
+            gt_boxes = target["boxes"].cpu().numpy()
+            gt_detections = sv.Detections(xyxy=gt_boxes)
+            
+            # Extract phrases for GT using tokenized input
+            if "positive_map" in target:
+                gt_logits = target["positive_map"].float()  # Convert to float
+                gt_phrases = self.extract_phrases(gt_logits, tokenized, tokenizer)
+            else:
+                gt_phrases = None
+                
+            image_bgr = self.gt_annotator.annotate(
+                scene=image_bgr,
+                detections=gt_detections,
+                labels=gt_phrases
+            )
+        
+        cv2.imwrite(os.path.join(save_dir, f'val_img_{image_id}.jpg'), image_bgr)
+
+    def extract_phrases(self, logits, tokenized, tokenizer):
+        phrases = []
+        for logit in logits:
+            # Combine attention mask with confidence threshold
+            text_mask = logit > self.text_threshold
+            attention_mask = tokenized.attention_mask[0]  # [seq_len]
+            combined_mask = text_mask & attention_mask.bool()
+
+            valid_tokens = [
+                tid.item() 
+                for tid, mask in zip(tokenized.input_ids[0], combined_mask)
+                if tid not in [tokenizer.cls_token_id, tokenizer.sep_token_id] and mask
+            ]
+            
+            if valid_tokens:
+                phrase = tokenizer.decode(valid_tokens)
+                conf = logit.max().item()
+                phrases.append(f"{phrase} ({conf:.2f})")
+        return phrases
+
+    def forward_for_single_feature_map(self, box_regression, centerness, anchors,dot_product_logits=None,
+                                    tokenizer=None,tokenized=None,):
 
         N, _, H, W = box_regression.shape
 
@@ -849,7 +946,7 @@ class Predictor(torch.nn.Module):
         #Passing through sigmoid for dor product logits
         dot_product_logits = dot_product_logits.sigmoid()
 
-        scores = aggregate_scores(logits=dot_product_logits,score_agg=self.score_agg)
+        scores = aggregate_scores(dot_product_logits,score_agg=self.score_agg)
 
         box_cls = scores
 
@@ -865,21 +962,31 @@ class Predictor(torch.nn.Module):
 
         # multiply the classification scores with centerness scores
 
-        box_cls = box_cls * centerness[:, :, None]
+        box_cls = box_cls * centerness
 
         results = []
 
-        for per_box_cls, per_box_regression, per_pre_nms_top_n, per_candidate_inds, per_anchors \
-                in zip(box_cls, box_regression, pre_nms_top_n, candidate_inds, anchors):
-
-            per_box_cls = per_box_cls[per_candidate_inds]
-
+        for batch_idx, (per_box_cls, per_box_regression, per_pre_nms_top_n, per_candidate_inds, per_anchors) \
+                in enumerate(zip(box_cls, box_regression, pre_nms_top_n, candidate_inds, anchors)):
+            # Add check for empty predictions
+            if not per_candidate_inds.any():
+                print(f"No Boxes valid !!")
+                # Return empty BoxList with same image size
+                empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy")
+                empty_boxlist.add_field("labels", torch.zeros(0, dtype=torch.long))
+                empty_boxlist.add_field("scores", torch.zeros(0))
+                empty_boxlist.add_field("phrases", [])  # Add empty phrases field
+                results.append(empty_boxlist)
+                continue
+            
+            print(f"Boxes valid !!")
+            per_box_cls = per_box_cls[per_candidate_inds]  # Shape: num_valid_boxes
             per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
 
-            per_candidate_nonzeros = per_candidate_inds.nonzero()[top_k_indices, :]
-
-            per_box_loc = per_candidate_nonzeros[:, 0]
-            per_class = per_candidate_nonzeros[:, 1] + 1
+            # Modified to handle single class case
+            per_candidate_nonzeros = per_candidate_inds.nonzero().squeeze(1)[top_k_indices]
+            per_box_loc = per_candidate_nonzeros  
+            per_class = torch.ones_like(per_box_loc)  # All boxes belong to same class
 
             detections = self.box_coder.decode(
                 per_box_regression[per_box_loc, :].view(-1, 4),
@@ -891,22 +998,40 @@ class Predictor(torch.nn.Module):
             boxlist.add_field("scores", torch.sqrt(per_box_cls))
             boxlist = boxlist.clip_to_image(remove_empty=False)
             boxlist = remove_small_boxes(boxlist, self.min_size)
+
+            if tokenized is not None and tokenizer is not None:
+                per_phrases_logits = dot_product_logits[batch_idx, per_box_loc]
+                phrases = self.extract_phrases(per_phrases_logits, tokenized, tokenizer)
+                boxlist.add_field("phrases", phrases)
+
             results.append(boxlist)
 
         return results
 
-    def forward(self, box_regression, centerness, anchors,dot_product_logits=None,positive_map=None):
+    def forward(self, box_regression, centerness, anchors, dot_product_logits=None,tokenizer=None, tokenized=None,
+                image=None,targets=None,epoch=None):
         sampled_boxes = []
         anchors = list(zip(*anchors))
         for idx, (b, c, a) in enumerate(zip(box_regression, centerness, anchors)):
             d = dot_product_logits[idx]
-            sampled_boxes.append(self.forward_for_single_feature_map(b, c, a, d, positive_map))
+            sampled_boxes.append(self.forward_for_single_feature_map(b, c, a, d, tokenizer=tokenizer, tokenized=tokenized))
 
         boxlists = list(zip(*sampled_boxes))
         boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
         boxlists = self.select_over_all_levels(boxlists)
 
+        self.visualize_predictions(
+                    image_tensor=image,  
+                    boxlist=boxlists,
+                    target=targets,
+                    image_id=targets.get("image_id", idx),
+                    epoch=epoch,
+                    tokenizer=tokenizer,
+                    tokenized=tokenized
+                )
+
         return boxlists
+    
 
 
     def select_over_all_levels(self, boxlists):
@@ -920,10 +1045,7 @@ class Predictor(torch.nn.Module):
             # Limit to max_per_image detections **over all classes**
             if number_of_detections > self.fpn_post_nms_top_n > 0:
                 cls_scores = result.get_field("scores")
-                image_thresh, _ = torch.kthvalue(
-                    cls_scores.cpu().float(),
-                    number_of_detections - self.fpn_post_nms_top_n + 1
-                )
+                image_thresh, _ = torch.kthvalue(cls_scores.cpu().float(),number_of_detections - self.fpn_post_nms_top_n + 1)
                 keep = cls_scores >= image_thresh.item()
                 keep = torch.nonzero(keep).squeeze(1)
                 result = result[keep]

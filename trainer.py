@@ -54,8 +54,8 @@ class COCOGLIPDataset(Dataset):
         # Transform pipeline
         if transforms is None:
             self.transforms = Compose([
-                Resize((480, 560, 640, 720, 800), max_size=1333),
-                #Resize((480), max_size=600),
+                #Resize((480, 560, 640, 720, 800), max_size=1333),
+                Resize((800), max_size=1333),
                 ToTensor(),
                 Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
@@ -177,35 +177,36 @@ class GLIP(nn.Module):
             losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
             return losses
         else:
-            # DO inference
+        # DO inference
+            detections=self.predictor(bbox_reg, centerness, anchors, dot_product_logits,
+                                      self.backbone.tokenizer,features["language"]["tokenized"],
+                                      images.tensors,targets,targets.get("epoch",0))
+            return detections
             
-        
-       
 
 def train_step(model, batch, optimizer, device):
+    model.train()
     images, targets, sizes, captions = prepare_batch(batch, device)
-    
     # Forward pass with separated inputs
     with torch.autocast(device_type="cuda",dtype=torch.float16):
         losses = model(images, sizes, captions,targets)
-    
     # Total loss
     total_loss = sum(losses.values())
-    
     # Backward pass
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
-    
     return losses
 
-
-def inference_step(model, batch, device):
+def val_step(model, batch, device,epoch):
     model.eval()
-    with torch.no_grad():
-        images, targets = prepare_batch(batch, model, device)
-        predictions, _ = model(images, targets)
-        return predictions
+    images, targets, sizes, captions = prepare_batch(batch, device)
+    # Forward pass with separated inputs
+    targets[0]["epoch"]=epoch
+    with torch.autocast(device_type="cuda",dtype=torch.float16):
+        detection = model(images, sizes, captions,targets)
+    print(detection)
+
 
 
 def train_glip():
@@ -239,10 +240,10 @@ def train_glip():
     )
     
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=2,
+        train_dataset,
+        batch_size=1,
         shuffle=False,
-        num_workers=4,
+        num_workers=1,
         collate_fn=lambda x: tuple(zip(*x)),
         pin_memory=True
     )
@@ -257,12 +258,14 @@ def train_glip():
     #val_interval = 5    # Perform validation every 5 epochs
 
     for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
         
+        for batch_idx,batch in enumerate(val_loader):
+            val_step(model, batch, device,epoch)
+
+        total_loss = 0
         for batch_idx, batch in enumerate(train_loader):
-            if batch_idx>2:
-                break
+            #if batch_idx>2:
+            #    break
             # Move data to device and perform a training step
             batch_loss_dict = train_step(model, batch, optimizer, device)  # train_step returns a dict
             batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
