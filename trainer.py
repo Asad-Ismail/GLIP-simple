@@ -6,13 +6,10 @@ from pycocotools.coco import COCO
 import torchvision.transforms as T
 from PIL import Image
 import numpy as np
-from typing import Tuple, Dict, List
-from transformers import BertTokenizer
 import os
 from utils import Resize,ToTensor,Normalize,Compose
 from utils import prepare_batch,convert_od_to_grounding_data
 from glip import GLIPBackbone,VLDyHead
-#from head import GLIPHead
 from rpn_head import GLIPHead
 from anchor_generator import anchor_generator_simple
 from bounding_box import BoxList
@@ -51,8 +48,8 @@ class COCOGLIPDataset(Dataset):
         # Transform pipeline
         if transforms is None:
             self.transforms = Compose([
-                #Resize((480, 560, 640, 720, 800), max_size=1333),
-                Resize((480), max_size=600),
+                Resize((480, 560, 640, 720, 800), max_size=1333),
+                #Resize((480), max_size=600),
                 ToTensor(),
                 Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
@@ -132,7 +129,7 @@ class COCOGLIPDataset(Dataset):
 class GLIP(nn.Module):
     def __init__(self, hidden_dim=256, num_classes=None):
         super().__init__()
-        # For COCO, num_classes is 80 (91 total with background, but we use 80 for detection)
+        # For COCO, num_classes is 80 (81 total with background, but we use 80 for detection)
         if num_classes is None:
             num_classes = 80  # COCO default
         
@@ -145,7 +142,8 @@ class GLIP(nn.Module):
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        features = self.backbone(images, sizes, captions)
+        with torch.no_grad():
+            features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
@@ -157,9 +155,7 @@ class GLIP(nn.Module):
         # Get predictions from head
         head_input = {
             'visual': fused_features['visual'],
-            'lang': fused_features['lang'],
-            #'original_sizes': original_sizes,
-            #'targets': targets
+            'lang': fused_features['lang']
         }
         
         logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
@@ -171,7 +167,6 @@ class GLIP(nn.Module):
             losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
             return losses
         
-        return logits, bbox_reg, centerness, dot_product_logits
        
 
 def train_step(model, batch, optimizer, device):
@@ -179,10 +174,7 @@ def train_step(model, batch, optimizer, device):
     
     # Forward pass with separated inputs
     with torch.autocast(device_type="cuda",dtype=torch.float16):
-        predictions = model(images, sizes, captions,targets)
-    
-    # Compute losses
-    losses = compute_losses(predictions, targets)
+        losses = model(images, sizes, captions,targets)
     
     # Total loss
     total_loss = sum(losses.values())
@@ -243,69 +235,59 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5) #weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     
     # Training loop
     num_epochs = 100
+    log_interval = 5  # Print stats every 100 batches
+    #val_interval = 5    # Perform validation every 5 epochs
+
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
         
         for batch_idx, batch in enumerate(train_loader):
-            # Move data to device
-            total_batch_loss = train_step(model, batch, optimizer, device)
+            # Move data to device and perform a training step
+            batch_loss_dict = train_step(model, batch, optimizer, device)  # train_step returns a dict
+            batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
             
-            total_loss += total_batch_loss.item()
+            # Accumulate total loss
+            total_loss += batch_loss.item()
             
-            if batch_idx % 100 == 0:
-                print(f'Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {total_batch_loss.item():.4f}')
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                images = batch['images'].to(device)
-                boxes = batch['boxes'].to(device)
-                categories = batch['categories'].to(device)
-                positive_maps = batch['positive_maps'].to(device)
-                
-                targets = {
-                    'boxes': boxes,
-                    'labels': categories,
-                    'positive_maps': positive_maps
-                }
-                
-                losses = model(
-                    images,
-                    batch['original_sizes'],
-                    batch['captions'],
-                    targets
+            # Print batch stats every `log_interval` steps
+            if batch_idx % log_interval == 0:
+                current_lr = optimizer.param_groups[0]['lr']  # Get current learning rate
+                loss_details = ", ".join(
+                    [f"{k}: {v.item():.4f}" for k, v in batch_loss_dict.items()]
                 )
-                val_loss += sum(losses.values()).item()
-        
-        # Print epoch statistics
+                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                    f"Batch Loss: {batch_loss.item():.4f}, LR: {current_lr:.6f}, {loss_details}")
+
+        # Calculate average training loss for the epoch
         avg_train_loss = total_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
-        print(f'Epoch {epoch+1}/{num_epochs}:')
+
+        # Print epoch statistics
+        print(f'\nEpoch {epoch+1}/{num_epochs}')
         print(f'Average Train Loss: {avg_train_loss:.4f}')
-        print(f'Average Val Loss: {avg_val_loss:.4f}')
-        
-        # Update learning rate
+
+        # Step the scheduler
         scheduler.step()
-        
-        # Save checkpoint
+
+        # Save checkpoint every 10 epochs
+        '''
         if (epoch + 1) % 10 == 0:
+            checkpoint_path = f'checkpoint_epoch_{epoch+1}.pth'
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss
-            }, f'checkpoint_epoch_{epoch+1}.pth')
+                #'val_loss': avg_val_loss
+            }, checkpoint_path)
+            print(f'Checkpoint saved: {checkpoint_path}')
+        '''
 
 if __name__ == '__main__':
     train_glip()

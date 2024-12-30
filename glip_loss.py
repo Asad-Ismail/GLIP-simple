@@ -9,7 +9,6 @@ from boxlist_ops import boxlist_iou
 INF = 1e8
 
 
-
 class BoxCoder(object):
 
     def __init__(self):
@@ -127,13 +126,6 @@ class TokenSigmoidFocalLoss(nn.Module):
         loss = loss_func(logits, targets, self.alpha, self.gamma, text_masks)
         return loss.sum()
 
-    def repr(self):
-        tmpstr =  "("
-        tmpstr += "gamma=" + str(self.gamma)
-        tmpstr += ", alpha=" + str(self.alpha)
-        tmpstr += ")"
-        return tmpstr
-
 
 def cls_sigmoid_focal_loss(logits, targets, gamma, alpha):
     """
@@ -179,14 +171,6 @@ class ClsSigmoidFocalLoss(nn.Module):
         loss_func = cls_sigmoid_focal_loss
         loss = loss_func(logits, targets, self.gamma, self.alpha)
         return loss.sum()
-
-    def __repr__(self):
-        tmpstr = self.__class__.__name__ + "("
-        tmpstr += "gamma=" + str(self.gamma)
-        tmpstr += ", alpha=" + str(self.alpha)
-        tmpstr += ")"
-        return tmpstr
-
 
 
 class GLIPLoss(nn.Module):
@@ -248,7 +232,7 @@ class GLIPLoss(nn.Module):
         
         
         losses = {
-            "loss_cls": cls_loss,
+            "loss_cls": cls_loss* 0.0,
             "loss_reg": reg_loss * 2.0,
             "loss_centerness": centerness_loss,
             "loss_dot_product_token": dot_product_token_loss

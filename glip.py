@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel,BertTokenizerFast
-from torchvision.ops import generalized_box_iou_loss
-from typing import OrderedDict
 from torchvision.models import swin_b
+from torch.utils.checkpoint import checkpoint
 
 
 class GLIPBackbone(nn.Module):
@@ -124,7 +123,7 @@ class GLIPBackbone(nn.Module):
         }
 
 class VLDyHead(nn.Module):
-    def __init__(self, num_convs=4, hidden_dim=256, in_channels=256):
+    def __init__(self, num_convs=2, hidden_dim=256, in_channels=256):
         super().__init__()
         
         # Build tower layers
@@ -234,7 +233,7 @@ class BiMultiHeadAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
 
-        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1).half()
+        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
 
         attn_probs_v = F.dropout(attn_weights_v, p=self.dropout, training=self.training)
         attn_probs_l = F.dropout(attn_weights_l, p=self.dropout, training=self.training)
@@ -302,10 +301,15 @@ class VLFuse(nn.Module):
         self.bi_attn = BiAttentionBlock(
             v_dim=hidden_dim,
             l_dim=768,
-            embed_dim=2048,
+            embed_dim=hidden_dim,
             num_heads=8,
             dropout=0.1
         )
+
+        def bi_attn_wrapper(visual_feats, visual_masks, lang_hidden, lang_masks):
+            return self.bi_attn(visual_feats, visual_masks, lang_hidden, lang_masks)
+        
+        self.ckpt_bi_attn=bi_attn_wrapper
     
     def forward(self, x):
         visual_feats = x["visual"]
@@ -313,11 +317,19 @@ class VLFuse(nn.Module):
         lang_dict = x["lang"]
 
         # Do cross-modal fusion with masks
-        fused_visual, fused_lang = self.bi_attn(
-            visual_feats,
-            visual_masks,
-            lang_dict["hidden"],
-            lang_dict["masks"]
+        #fused_visual, fused_lang = self.bi_attn(
+        #    visual_feats,
+        #    visual_masks,
+        #    lang_dict["hidden"],
+        #    lang_dict["masks"]
+        #)
+        fused_visual, fused_lang = checkpoint(
+            self.ckpt_bi_attn, 
+            visual_feats, 
+            visual_masks, 
+            lang_dict["hidden"], 
+            lang_dict["masks"],
+            use_reentrant=False
         )
         
         return {
