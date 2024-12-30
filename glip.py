@@ -210,12 +210,12 @@ class BiMultiHeadAttention(nn.Module):
 
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
-        # Clamping is important for stability and OOO CUDA ERROR
+        # Clamping is important for stability 
         attn_weights.clamp_(min=-50000, max=50000)
 
         attn_weights_T = attn_weights.transpose(1, 2)
         attn_weights_l = (attn_weights_T - torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
-         # Clamping is important for stability and OOO CUDA ERROR
+        # Clamping is important for stability 
         attn_weights_l.clamp_(min=-50000, max=50000)
         attn_weights_l = attn_weights_l.softmax(dim=-1)
 

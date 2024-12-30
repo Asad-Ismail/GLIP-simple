@@ -180,7 +180,7 @@ class GLIP(nn.Module):
         # DO inference
             detections=self.predictor(bbox_reg, centerness, anchors, dot_product_logits,
                                       self.backbone.tokenizer,features["language"]["tokenized"],
-                                      images.tensors,targets,targets.get("epoch",0))
+                                      images.tensors,targets[0],targets[0].get("epoch",0))
             return detections
             
 

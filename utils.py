@@ -15,6 +15,7 @@ import numpy as np
 import cv2
 from bounding_box import BoxList
 from boxlist_ops import cat_boxlist, boxlist_ml_nms, remove_small_boxes
+import supervision as sv
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):
     """construct a map such that positive_map[i,j] = True iff box i is associated to token j
@@ -842,6 +843,21 @@ class Predictor(torch.nn.Module):
         self.score_agg = score_agg
         self.mean = torch.tensor([0.485, 0.456, 0.406])
         self.std = torch.tensor([0.229, 0.224, 0.225])
+        self.save_dir="visualizations"
+
+
+        self.pred_annotator = sv.BoxAnnotator(
+            color=sv.Color.red(),
+            thickness=8,
+            text_scale=0.8,
+            text_padding=3
+        )
+        self.gt_annotator = sv.BoxAnnotator(
+            color=sv.Color.green(),
+            thickness=2,
+            text_scale=0.8,
+            text_padding=3
+        )
 
     def denormalize_image(self, image):
         """
@@ -851,11 +867,12 @@ class Predictor(torch.nn.Module):
         Returns:
             numpy array [H,W,C] with values in [0,255]
         """
+        device=image.device
         # Move channels to end: [C,H,W] -> [H,W,C]
-        image = image.permute(1, 2, 0)
+        image = image.squeeze(0).permute(1, 2, 0)
         
         # Denormalize
-        image = image * self.std + self.mean
+        image = image * self.std.to(device) + self.mean.to(device)
         
         # Clip values to [0,1]
         image = torch.clamp(image, 0, 1)
@@ -886,7 +903,7 @@ class Predictor(torch.nn.Module):
         
         
         # Draw predictions
-        if len(boxlist) > 0:
+        if len(boxlist[0][0]) > 0:
             pred_boxes = boxlist.bbox.cpu().numpy()
             pred_detections = sv.Detections(xyxy=pred_boxes)
             pred_phrases = boxlist.get_field("phrases") if boxlist.has_field("phrases") else None
@@ -898,7 +915,7 @@ class Predictor(torch.nn.Module):
         
         # Draw ground truth - extract phrases from target logits
         if target is not None and len(target["boxes"]) > 0:
-            gt_boxes = target["boxes"].cpu().numpy()
+            gt_boxes = target["boxes"].bbox.cpu().numpy()
             gt_detections = sv.Detections(xyxy=gt_boxes)
             
             # Extract phrases for GT using tokenized input
@@ -970,7 +987,7 @@ class Predictor(torch.nn.Module):
                 in enumerate(zip(box_cls, box_regression, pre_nms_top_n, candidate_inds, anchors)):
             # Add check for empty predictions
             if not per_candidate_inds.any():
-                print(f"No Boxes valid !!")
+                print(f"❌ Level {batch_idx}: No valid boxes found (0/{box_cls.shape[-1]} passed threshold {self.pre_nms_thresh:.3f})")
                 # Return empty BoxList with same image size
                 empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy")
                 empty_boxlist.add_field("labels", torch.zeros(0, dtype=torch.long))
@@ -979,7 +996,7 @@ class Predictor(torch.nn.Module):
                 results.append(empty_boxlist)
                 continue
             
-            print(f"Boxes valid !!")
+            print(f"✅ Level {batch_idx}: Found {len(per_candidate_inds)}/{box_cls.shape[-1]} valid boxes above threshold {self.pre_nms_thresh:.3f}")
             per_box_cls = per_box_cls[per_candidate_inds]  # Shape: num_valid_boxes
             per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
 
@@ -1017,8 +1034,10 @@ class Predictor(torch.nn.Module):
             sampled_boxes.append(self.forward_for_single_feature_map(b, c, a, d, tokenizer=tokenizer, tokenized=tokenized))
 
         boxlists = list(zip(*sampled_boxes))
-        boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
-        boxlists = self.select_over_all_levels(boxlists)
+        ## Handle Empty boxes
+        if not all(len(boxes[0]) == 0 for boxes in boxlists):
+            boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
+            boxlists = self.select_over_all_levels(boxlists)
 
         self.visualize_predictions(
                     image_tensor=image,  
