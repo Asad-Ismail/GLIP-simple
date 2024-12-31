@@ -903,7 +903,7 @@ class Predictor(torch.nn.Module):
         
         
         # Draw predictions
-        if len(boxlist) > 0 and len(boxlist[0].bbox) > 0:
+        if len(boxlist) > 0 and hasattr(boxlist[0], 'bbox') and len(boxlist[0].bbox) > 0:
             boxlist=boxlist[0]
             pred_boxes = boxlist.bbox.cpu().numpy()
             pred_detections = sv.Detections(xyxy=pred_boxes)

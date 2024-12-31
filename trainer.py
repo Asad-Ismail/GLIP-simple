@@ -253,7 +253,7 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4) #weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4) #weight_decay=1e-4)
     #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
     scheduler = optim.lr_scheduler.StepLR(
     optimizer, 
