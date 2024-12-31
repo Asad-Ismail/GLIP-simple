@@ -833,12 +833,12 @@ class Predictor(torch.nn.Module):
             score_agg='MEAN',
     ):
         super().__init__()
-        self.pre_nms_thresh = 0.05
+        self.pre_nms_thresh = 0.01
         self.pre_nms_top_n = 1000
         self.nms_thresh = 0.6
         self.fpn_post_nms_top_n = 100
         self.min_size = 0
-        self.text_threshold = 0.2
+        self.text_threshold = 0.1
         self.box_coder = box_coder
         self.score_agg = score_agg
         self.mean = torch.tensor([0.485, 0.456, 0.406])
@@ -903,7 +903,7 @@ class Predictor(torch.nn.Module):
         
         
         # Draw predictions
-        if len(boxlist[0][0]) > 0:
+        if len(boxlist) > 0 and len(boxlist[0].bbox) > 0:
             pred_boxes = boxlist.bbox.cpu().numpy()
             pred_detections = sv.Detections(xyxy=pred_boxes)
             pred_phrases = boxlist.get_field("phrases") if boxlist.has_field("phrases") else None
@@ -951,6 +951,8 @@ class Predictor(torch.nn.Module):
                 phrase = tokenizer.decode(valid_tokens)
                 conf = logit.max().item()
                 phrases.append(f"{phrase} ({conf:.2f})")
+            else:
+                phrases.append(f"NoObj")
         return phrases
 
     def forward_for_single_feature_map(self, box_regression, centerness, anchors,dot_product_logits=None,
@@ -991,7 +993,7 @@ class Predictor(torch.nn.Module):
             if not per_candidate_inds.any():
                 print(f"❌ Level {batch_idx}: No valid boxes found (0/{box_cls.shape[-1]} passed threshold {self.pre_nms_thresh:.3f})")
                 # Return empty BoxList with same image size
-                empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy")
+                empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy").to(box_cls.device)
                 empty_boxlist.add_field("labels", torch.zeros(0, dtype=torch.long))
                 empty_boxlist.add_field("scores", torch.zeros(0))
                 empty_boxlist.add_field("phrases", [])  # Add empty phrases field

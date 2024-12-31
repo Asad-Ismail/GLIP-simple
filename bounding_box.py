@@ -221,7 +221,16 @@ class BoxList(object):
     def __getitem__(self, item):
         bbox = BoxList(self.bbox[item], self.size, self.mode)
         for k, v in self.extra_fields.items():
-            bbox.add_field(k, v[item])
+            if isinstance(v, (list, tuple)):
+                # For list/tuple fields (like phrases), handle differently
+                if isinstance(item, int):
+                    bbox.add_field(k, [v[item]])  # Single item -> list with one element
+                else:
+                    # For slice/tensor indices, select multiple items
+                    bbox.add_field(k, [v[i] for i in item])
+            else:
+                # Normal tensor indexing for other fields
+                bbox.add_field(k, v[item])
         return bbox
 
     def __len__(self):

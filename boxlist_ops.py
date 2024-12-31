@@ -140,6 +140,12 @@ def _cat(tensors, dim=0):
     assert isinstance(tensors, (list, tuple))
     if len(tensors) == 1:
         return tensors[0]
+    elif isinstance(tensors[0], (list, tuple)):
+        # For lists/tuples (like phrases), concatenate using extend
+        result = []
+        for t in tensors:
+            result.extend(t)
+        return result
     if isinstance(tensors[0], torch.Tensor):
         return torch.cat(tensors, dim)
     else:
@@ -168,6 +174,13 @@ def cat_boxlist(bboxes):
     cat_boxes = BoxList(_cat([bbox.bbox for bbox in bboxes], dim=0), size, mode)
 
     for field in fields:
+        #if field == "phrases":
+            # Special handling for phrases: simply concatenate lists
+        #    phrases = []
+        #    for bbox in bboxes:
+        #        phrases.extend(bbox.get_field("phrases"))
+        #    cat_boxes.add_field(field, phrases)
+        #else:
         data = _cat([bbox.get_field(field) for bbox in bboxes], dim=0)
         cat_boxes.add_field(field, data)
 

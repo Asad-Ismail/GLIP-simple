@@ -203,12 +203,11 @@ def train_step(model, batch, optimizer, device,scaler):
 
 def val_step(model, batch, device,epoch):
     model.eval()
-    with torch.no_grad():
-        images, targets, sizes, captions = prepare_batch(batch, device)
-        # Forward pass with separated inputs
-        targets[0]["epoch"]=epoch
-        with torch.autocast(device_type="cuda",dtype=torch.float16):
-            detection = model(images, sizes, captions,targets)
+    images, targets, sizes, captions = prepare_batch(batch, device)
+    # Forward pass with separated inputs
+    targets[0]["epoch"]=epoch
+    with torch.autocast(device_type="cuda",dtype=torch.float16):
+        detection = model(images, sizes, captions,targets)
     print(detection)
 
 
