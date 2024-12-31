@@ -201,6 +201,7 @@ def train_step(model, batch, optimizer, device,scaler):
     scaler.update()
     return losses
 
+@torch.no_grad
 def val_step(model, batch, device,epoch):
     model.eval()
     images, targets, sizes, captions = prepare_batch(batch, device)

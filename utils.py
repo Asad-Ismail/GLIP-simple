@@ -833,7 +833,7 @@ class Predictor(torch.nn.Module):
             score_agg='MEAN',
     ):
         super().__init__()
-        self.pre_nms_thresh = 0.01
+        self.pre_nms_thresh = 0.05
         self.pre_nms_top_n = 1000
         self.nms_thresh = 0.6
         self.fpn_post_nms_top_n = 100
@@ -904,6 +904,7 @@ class Predictor(torch.nn.Module):
         
         # Draw predictions
         if len(boxlist) > 0 and len(boxlist[0].bbox) > 0:
+            boxlist=boxlist[0]
             pred_boxes = boxlist.bbox.cpu().numpy()
             pred_detections = sv.Detections(xyxy=pred_boxes)
             pred_phrases = boxlist.get_field("phrases") if boxlist.has_field("phrases") else None
