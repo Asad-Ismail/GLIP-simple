@@ -994,7 +994,7 @@ class Predictor(torch.nn.Module):
             if not per_candidate_inds.any():
                 print(f"❌ Level {batch_idx}: No valid boxes found (0/{box_cls.shape[-1]} passed threshold {self.pre_nms_thresh:.3f})")
                 # Return empty BoxList with same image size
-                empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy").to(box_cls.device)
+                empty_boxlist = BoxList(torch.zeros((0, 4)), per_anchors.size, mode="xyxy").to("cpu")
                 empty_boxlist.add_field("labels", torch.zeros(0, dtype=torch.long))
                 empty_boxlist.add_field("scores", torch.zeros(0))
                 empty_boxlist.add_field("phrases", [])  # Add empty phrases field
@@ -1014,10 +1014,11 @@ class Predictor(torch.nn.Module):
                 per_box_regression[per_box_loc, :].view(-1, 4),
                 per_anchors.bbox[per_box_loc, :].view(-1, 4)
             )
-
-            boxlist = BoxList(detections, per_anchors.size, mode="xyxy")
-            boxlist.add_field("labels", per_class)
-            boxlist.add_field("scores", torch.sqrt(per_box_cls))
+            # Move detction back to cpus since prashes are strings and live on cpus and some empty tensors are also on cpus just easier to have everything 
+            # in cpu
+            boxlist = BoxList(detections, per_anchors.size, mode="xyxy").to("cpu")
+            boxlist.add_field("labels", per_class.cpu())
+            boxlist.add_field("scores", torch.sqrt(per_box_cls).cpu())
             boxlist = boxlist.clip_to_image(remove_empty=False)
             boxlist = remove_small_boxes(boxlist, self.min_size)
 
@@ -1043,7 +1044,8 @@ class Predictor(torch.nn.Module):
         #print(f"Pred intial box lists {boxlists}")
         ## Handle Empty boxes
         #print(print(f"Boxlists structure: {[print(b) for b in boxlists]}"))
-        if any(len(boxlist[0].bbox) > 0 for boxlist in boxlists):
+        # First level is for batch and second level is for freature list
+        if any(any(len(box.bbox) > 0 for box in boxlist) for boxlist in boxlists):
             boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
             boxlists = self.select_over_all_levels(boxlists)
             print(f"Pred concat box lists {boxlists}")

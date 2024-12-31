@@ -151,8 +151,8 @@ class GLIP(nn.Module):
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        #with torch.no_grad():
-        features = self.backbone(images, sizes, captions)
+        with torch.no_grad():
+            features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
@@ -209,7 +209,7 @@ def val_step(model, batch, device,epoch):
     targets[0]["epoch"]=epoch
     with torch.autocast(device_type="cuda",dtype=torch.float16):
         detection = model(images, sizes, captions,targets)
-    print(detection)
+    #print(detection)
 
 
 
@@ -253,7 +253,7 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4) #weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-5) #weight_decay=1e-4)
     #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
     scheduler = optim.lr_scheduler.StepLR(
     optimizer, 

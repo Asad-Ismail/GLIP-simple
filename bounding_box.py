@@ -22,6 +22,8 @@ class BoxList(object):
         if (not isinstance(bbox, torch.Tensor)
                 or bbox.dtype != torch.float32 or bbox.device != device):
             bbox = torch.as_tensor(bbox, dtype=torch.float32, device=device)
+        if isinstance(bbox,torch.Tensor) and bbox.ndimension() != 2:
+            bbox=bbox.reshape(-1,4)
         if bbox.ndimension() != 2:
             raise ValueError(
                 "bbox should have 2 dimensions, got {}".format(bbox.ndimension())
