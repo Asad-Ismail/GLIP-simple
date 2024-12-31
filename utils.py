@@ -965,6 +965,8 @@ class Predictor(torch.nn.Module):
 
         scores = aggregate_scores(dot_product_logits,score_agg=self.score_agg)
 
+        print(f"Pred scores max are {scores.max()}")
+
         box_cls = scores
 
         box_regression = permute_and_flatten(box_regression, N, A, 4, H, W)
@@ -1033,11 +1035,15 @@ class Predictor(torch.nn.Module):
             d = dot_product_logits[idx]
             sampled_boxes.append(self.forward_for_single_feature_map(b, c, a, d, tokenizer=tokenizer, tokenized=tokenized))
 
+        #print(f"GT box list is {targets['boxes']}")
         boxlists = list(zip(*sampled_boxes))
+        #print(f"Pred intial box lists {boxlists}")
         ## Handle Empty boxes
-        if not all(len(boxes[0]) == 0 for boxes in boxlists):
+        #print(print(f"Boxlists structure: {[print(b) for b in boxlists]}"))
+        if any(len(boxlist[0].bbox) > 0 for boxlist in boxlists):
             boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
             boxlists = self.select_over_all_levels(boxlists)
+            print(f"Pred concat box lists {boxlists}")
 
         self.visualize_predictions(
                     image_tensor=image,  

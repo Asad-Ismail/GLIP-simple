@@ -151,8 +151,8 @@ class GLIP(nn.Module):
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        with torch.no_grad():
-            features = self.backbone(images, sizes, captions)
+        #with torch.no_grad():
+        features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
@@ -184,27 +184,31 @@ class GLIP(nn.Module):
             return detections
             
 
-def train_step(model, batch, optimizer, device):
+def train_step(model, batch, optimizer, device,scaler):
     model.train()
     images, targets, sizes, captions = prepare_batch(batch, device)
+
+    optimizer.zero_grad()
+
     # Forward pass with separated inputs
     with torch.autocast(device_type="cuda",dtype=torch.float16):
         losses = model(images, sizes, captions,targets)
-    # Total loss
-    total_loss = sum(losses.values())
+        total_loss = sum(losses.values())
+    
     # Backward pass
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
+    scaler.scale(total_loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
     return losses
 
 def val_step(model, batch, device,epoch):
     model.eval()
-    images, targets, sizes, captions = prepare_batch(batch, device)
-    # Forward pass with separated inputs
-    targets[0]["epoch"]=epoch
-    with torch.autocast(device_type="cuda",dtype=torch.float16):
-        detection = model(images, sizes, captions,targets)
+    with torch.no_grad():
+        images, targets, sizes, captions = prepare_batch(batch, device)
+        # Forward pass with separated inputs
+        targets[0]["epoch"]=epoch
+        with torch.autocast(device_type="cuda",dtype=torch.float16):
+            detection = model(images, sizes, captions,targets)
     print(detection)
 
 
@@ -249,18 +253,23 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4) #weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4) #weight_decay=1e-4)
+    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
+    scheduler = optim.lr_scheduler.StepLR(
+    optimizer, 
+    step_size=2000,  # Reduce LR every 200 epochs 
+    gamma=0.75       # Halve the LR
+)
     
     # Training loop
     num_epochs = 10000
     log_interval = 5  # Print stats every 100 batches
     #val_interval = 5    # Perform validation every 5 epochs
-
+    scaler = torch.amp.GradScaler()
     for epoch in range(num_epochs):
         
-        if epoch%500==0:
-            for batch_idx,batch in enumerate(val_loader):
+        if epoch%100==0:
+            for batch_idx,batch in enumerate(train_loader):
                 val_step(model, batch, device,epoch)
                 break
 
@@ -269,7 +278,7 @@ def train_glip():
             if batch_idx>0:
                 break
             # Move data to device and perform a training step
-            batch_loss_dict = train_step(model, batch, optimizer, device)  # train_step returns a dict
+            batch_loss_dict = train_step(model, batch, optimizer, device,scaler)  # train_step returns a dict
             batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
             
             # Accumulate total loss

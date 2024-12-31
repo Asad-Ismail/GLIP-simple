@@ -175,7 +175,7 @@ class GLIPLoss(nn.Module):
         reg_loss = self.GIoULoss(box_regression_flatten, reg_targets_flatten, anchors_flatten,
                                         weight=centerness_targets) 
                                     
-        centerness_loss = self.centerness_loss_func(centerness_flatten, centerness_targets)
+        centerness_loss = self.centerness_loss_func(centerness_flatten, centerness_targets)/len(centerness_targets)
         
         
         losses = {
