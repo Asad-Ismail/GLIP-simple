@@ -960,16 +960,11 @@ class Predictor(torch.nn.Module):
                                     tokenizer=None,tokenized=None,):
 
         N, _, H, W = box_regression.shape
-
         A = box_regression.size(1) // 4
-
         #Passing through sigmoid for dor product logits
         dot_product_logits = dot_product_logits.sigmoid()
-
         scores = aggregate_scores(dot_product_logits,score_agg=self.score_agg)
-
         print(f"Pred scores max are {scores.max()}")
-
         box_cls = scores
 
         box_regression = permute_and_flatten(box_regression, N, A, 4, H, W)
@@ -1048,7 +1043,6 @@ class Predictor(torch.nn.Module):
         if any(any(len(box.bbox) > 0 for box in boxlist) for boxlist in boxlists):
             boxlists = [cat_boxlist(boxlist) for boxlist in boxlists]
             boxlists = self.select_over_all_levels(boxlists)
-            print(f"Pred concat box lists {boxlists}")
 
         self.visualize_predictions(
                     image_tensor=image,  
@@ -1079,5 +1073,6 @@ class Predictor(torch.nn.Module):
                 keep = cls_scores >= image_thresh.item()
                 keep = torch.nonzero(keep).squeeze(1)
                 result = result[keep]
+            print(f"Output BBOX are {result.bbox}, with labels {boxlist.get_field("phrases") }")
             results.append(result)
         return results

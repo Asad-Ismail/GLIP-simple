@@ -253,7 +253,7 @@ def train_glip():
     )
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=3e-5) #weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4) #weight_decay=1e-4)
     #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
     scheduler = optim.lr_scheduler.StepLR(
     optimizer, 
@@ -268,7 +268,7 @@ def train_glip():
     scaler = torch.amp.GradScaler()
     for epoch in range(num_epochs):
         
-        if epoch%100==0:
+        if epoch%50==0:
             for batch_idx,batch in enumerate(train_loader):
                 val_step(model, batch, device,epoch)
                 break

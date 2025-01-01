@@ -66,12 +66,12 @@ class GLIPBackbone(nn.Module):
                 feature_masks[level] = feat_mask
         
         # Add P5
-        p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
-        p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
-                            size=p5.shape[-2:],
-                            mode='nearest')[0].bool()
-        features['p5'] = p5 * p5_mask.unsqueeze(1)
-        feature_masks['p5'] = p5_mask
+        #p5 = F.max_pool2d(features['p4'], kernel_size=2, stride=2)
+        #p5_mask = F.interpolate(feature_masks['p4'][None].float(), 
+        #                    size=p5.shape[-2:],
+        #                    mode='nearest')[0].bool()
+        #features['p5'] = p5 * p5_mask.unsqueeze(1)
+        #feature_masks['p5'] = p5_mask
             
         return features, feature_masks
 

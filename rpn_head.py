@@ -13,7 +13,7 @@ class GLIPHead(nn.Module):
         self.bbox_pred = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=1)
         self.centerness = nn.Conv2d(in_channels, num_anchors, kernel_size=1)
         
-        self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in range(4)])  
+        self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in range(3)])  
         
         # Bert language dimensions
         lang_dim = 768

@@ -155,9 +155,9 @@ def make_anchor_generator(config):
 
 
 def anchor_generator_simple():
-    anchor_sizes = ((64,),(128,),(256,),(512,))
+    anchor_sizes = ((64,),(128,),(256,))
     aspect_ratios = (1.0,)
-    anchor_strides = (8,16,32,64)
+    anchor_strides = (8,16,32)
     straddle_thresh = 0
 
     anchor_generator = AnchorGenerator(

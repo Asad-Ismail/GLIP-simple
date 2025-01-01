@@ -3,9 +3,11 @@ import torch
 
 from bounding_box import BoxList
 
-from maskrcnn_benchmark.layers import nms as _box_nms
-from maskrcnn_benchmark.layers import ml_nms as _box_ml_nms
+#from maskrcnn_benchmark.layers import nms as _box_nms
+#from maskrcnn_benchmark.layers import ml_nms as _box_ml_nms
 
+from torchvision.ops import nms as  _box_nms
+from torchvision.ops batched_nms  as _box_ml_nm
 
 def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="score"):
     """
@@ -47,6 +49,8 @@ def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
     """
     if nms_thresh <= 0:
         return boxlist
+    if len(boxlist.bbox) == 0:
+        return boxlist
     mode = boxlist.mode
     boxlist = boxlist.convert("xyxy")
     boxes = boxlist.bbox
@@ -56,18 +60,29 @@ def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
     if boxes.device==torch.device("cpu"):
         keep = []
         unique_labels = torch.unique(labels)
-        print(unique_labels)
         for j in unique_labels:
             inds = (labels == j).nonzero().view(-1)
 
             scores_j = scores[inds]
             boxes_j = boxes[inds, :].view(-1, 4)
             keep_j = _box_nms(boxes_j, scores_j, nms_thresh)
-
             keep += keep_j
     else:
         keep = _box_ml_nms(boxes, scores, labels.float(), nms_thresh)
-        
+        if len(boxlist.bbox) == 0:
+        return boxlist
+
+        if keep.dim() > 1:
+        keep = keep.squeeze()
+    
+    if keep.dim() > 1:
+        keep = keep.squeeze()
+    # Double check keep tensor is valid for indexing
+    if len(keep) == 0:
+        # Return empty boxlist with same size/mode Not asserting here dont want to break training
+        print(f"Input Boxes were not empty but nms output is empty check nms implemntation!!")
+        return BoxList(torch.zeros((0, 4), device=boxes.device), boxlist.size, boxlist.mode)
+
     if max_proposals > 0:
         keep = keep[: max_proposals]
     boxlist = boxlist[keep]
