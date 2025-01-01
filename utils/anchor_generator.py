@@ -5,9 +5,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from bounding_box import BoxList
-from image_list import ImageList
-from boxlist_ops import cat_boxlist
+from .bounding_box import BoxList
+from .image_list import ImageList
+from .boxlist_ops import cat_boxlist
 
 class BufferList(nn.Module):
     """

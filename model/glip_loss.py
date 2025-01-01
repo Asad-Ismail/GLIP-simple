@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from utils import concat_box_prediction_layers
-from boxlist_ops import cat_boxlist
-from boxlist_ops import boxlist_iou
+from utils.utils import concat_box_prediction_layers
+from utils.boxlist_ops import cat_boxlist
+from utils.boxlist_ops import boxlist_iou
 
 INF = 1e8
 

@@ -4,15 +4,15 @@ import torch.nn.functional as F
 from transformers import BertModel,BertTokenizerFast
 from torchvision.models import swin_b
 from torch.utils.checkpoint import checkpoint
-from glip_head import GLIPHead
-from anchor_generator import anchor_generator_simple
-from bounding_box import BoxList
-from glip_loss import GLIPLoss
-from image_list import ImageList
-from box_coder import BoxCoder 
-from utils import Predictor
-from utils import prepare_batch,convert_od_to_grounding_data
-from utils import prepare_batch,convert_od_to_grounding_data
+from .glip_head import GLIPHead
+from utils.anchor_generator import anchor_generator_simple
+from utils.bounding_box import BoxList
+from .glip_loss import GLIPLoss
+from utils.image_list import ImageList
+from utils.box_coder import BoxCoder 
+from utils.utils import Predictor
+from utils.utils import prepare_batch,convert_od_to_grounding_data
+from utils.utils import prepare_batch,convert_od_to_grounding_data
 
 class GLIPBackbone(nn.Module):
     def __init__(self, 

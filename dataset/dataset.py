@@ -5,9 +5,9 @@ from torch.utils.data import Dataset
 from PIL import Image
 import numpy as np
 import os
-from utils import Resize,ToTensor,Normalize,Compose
-from utils import prepare_batch,convert_od_to_grounding_data
-from bounding_box import BoxList
+from utils.utils import Resize,ToTensor,Normalize,Compose
+from utils.utils import prepare_batch,convert_od_to_grounding_data
+from utils.bounding_box import BoxList
 
 class COCOGLIPDataset(Dataset):
     def __init__(self, 

@@ -10,11 +10,10 @@ from typing import List, Optional
 from torch import Tensor
 from typing import List, Dict, Tuple
 import math
-from bounding_box import BoxList
+from .bounding_box import BoxList
 import numpy as np
 import cv2
-from bounding_box import BoxList
-from boxlist_ops import cat_boxlist, boxlist_ml_nms, remove_small_boxes
+from .boxlist_ops import cat_boxlist, boxlist_ml_nms, remove_small_boxes
 import supervision as sv
 
 def create_positive_map_from_span(tokenized, token_span, max_text_len=256):

@@ -4,9 +4,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 import os
-from dataset import COCOGLIPDataset
-from glip import GLIP
-from utils import prepare_batch
+from dataset.dataset import COCOGLIPDataset
+from model.glip import GLIP
+from utils.utils import prepare_batch
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
