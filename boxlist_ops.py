@@ -7,7 +7,7 @@ from bounding_box import BoxList
 #from maskrcnn_benchmark.layers import ml_nms as _box_ml_nms
 
 from torchvision.ops import nms as  _box_nms
-from torchvision.ops batched_nms  as _box_ml_nm
+from torchvision.ops import batched_nms  as _box_ml_nm
 
 def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="score"):
     """
@@ -69,11 +69,6 @@ def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
             keep += keep_j
     else:
         keep = _box_ml_nms(boxes, scores, labels.float(), nms_thresh)
-        if len(boxlist.bbox) == 0:
-        return boxlist
-
-        if keep.dim() > 1:
-        keep = keep.squeeze()
     
     if keep.dim() > 1:
         keep = keep.squeeze()
