@@ -34,6 +34,51 @@ def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="score"):
     return boxlist.convert(mode)
 
 
+
+def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
+                   score_field="scores", label_field="labels"):
+    if nms_thresh <= 0:
+        return boxlist
+    if len(boxlist.bbox) == 0:
+        return boxlist
+    
+    mode = boxlist.mode
+    boxlist = boxlist.convert("xyxy")
+    boxes = boxlist.bbox
+    scores = boxlist.get_field(score_field)
+    labels = boxlist.get_field(label_field)
+
+    if boxes.device == torch.device("cpu"):
+        keep_indices = []
+        unique_labels = torch.unique(labels)
+        for j in unique_labels:
+            inds = (labels == j).nonzero().view(-1)
+            scores_j = scores[inds]
+            boxes_j = boxes[inds, :].view(-1, 4)
+            keep_j = _box_nms(boxes_j, scores_j, nms_thresh)
+            # Convert indices back to original box indices
+            keep_indices.extend(inds[keep_j].tolist())
+        # Convert list to tensor
+        keep = torch.tensor(keep_indices, device=boxes.device, dtype=torch.long)
+    else:
+        keep = _box_ml_nms(boxes, scores, labels.float(), nms_thresh)
+    
+    if isinstance(keep, torch.Tensor) and keep.dim() > 1:
+        keep = keep.squeeze()
+    
+    if len(keep) == 0:
+        print("Input Boxes were not empty but nms output is empty check nms implementation!!")
+        return BoxList(torch.zeros((0, 4), device=boxes.device), boxlist.size, boxlist.mode)
+
+    if max_proposals > 0:
+        keep = keep[:max_proposals]
+
+    boxlist = boxlist[keep]
+    return boxlist.convert(mode)
+
+
+'''
+
 def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
                    score_field="scores", label_field="labels"):
     """
@@ -84,6 +129,8 @@ def boxlist_ml_nms(boxlist, nms_thresh, max_proposals=-1,
 
     return boxlist.convert(mode)
 
+    
+'''
 
 def remove_small_boxes(boxlist, min_size):
     """

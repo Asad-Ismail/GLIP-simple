@@ -4,7 +4,15 @@ import torch.nn.functional as F
 from transformers import BertModel,BertTokenizerFast
 from torchvision.models import swin_b
 from torch.utils.checkpoint import checkpoint
-
+from glip_head import GLIPHead
+from anchor_generator import anchor_generator_simple
+from bounding_box import BoxList
+from glip_loss import GLIPLoss
+from image_list import ImageList
+from box_coder import BoxCoder 
+from utils import Predictor
+from utils import prepare_batch,convert_od_to_grounding_data
+from utils import prepare_batch,convert_od_to_grounding_data
 
 class GLIPBackbone(nn.Module):
     def __init__(self, 
@@ -316,13 +324,6 @@ class VLFuse(nn.Module):
         visual_masks = x["visual_masks"]
         lang_dict = x["lang"]
 
-        # Do cross-modal fusion with masks
-        #fused_visual, fused_lang = self.bi_attn(
-        #    visual_feats,
-        #    visual_masks,
-        #    lang_dict["hidden"],
-        #    lang_dict["masks"]
-        #)
         fused_visual, fused_lang = checkpoint(
             self.ckpt_bi_attn, 
             visual_feats, 
@@ -455,10 +456,6 @@ class BertEncoderLayer(nn.Module):
         # Get inputs
         hidden = lang_dict["hidden"]
 
-        #if torch.isnan(hidden).any():
-        #    print("NaN in attention input")
-        #    return x
-
         mask = None
         if "masks" in lang_dict:
             # Stable mask creation
@@ -506,4 +503,56 @@ class DyConv(nn.Module):
             "lang": lang_dict              # Pass through
         }
 
-    
+
+
+class GLIP(nn.Module):
+    def __init__(self, hidden_dim=256, num_classes=None):
+        super().__init__()
+        # For COCO, num_classes is 80 (81 total with background, but we use 80 for detection)
+        if num_classes is None:
+            num_classes = 80  # COCO default
+        
+
+        self.box_coder = BoxCoder()
+        self.backbone = GLIPBackbone()
+        self.dyhead = VLDyHead(hidden_dim=hidden_dim)
+        self.anchor_generator=anchor_generator_simple()
+        self.head = GLIPHead(in_channels=hidden_dim, num_classes=num_classes)
+        self.loss_calculator = GLIPLoss(self.box_coder)
+        self.predictor= Predictor(self.box_coder)
+        
+    def forward(self, images, sizes, captions,targets=None):
+        """Forward pass without loss computation"""
+        # Get backbone features
+        with torch.no_grad():
+            features = self.backbone(images, sizes, captions)
+        
+        # Process through dynamic head
+        fused_features = self.dyhead({
+            'visual': list(features['visual'].values()),
+            'visual_masks': list(features['visual_masks'].values()),  # Add masks
+            'lang': features['language']
+        })
+        
+        # Get predictions from head
+        head_input = {
+            'visual': fused_features['visual'],
+            'lang': fused_features['lang']
+        }
+        
+        logits, bbox_reg, centerness, dot_product_logits = self.head(head_input)
+
+        # Only size of these image list is used to create anchors TODO Change it allow anchor generator to also expect only sizes to generator anchors
+        images_list=ImageList(images.tensors,sizes)
+        anchors = self.anchor_generator(images_list, fused_features['visual'])
+        
+        if self.training and targets is not None:
+            losses = self.loss_calculator(logits, bbox_reg, centerness, dot_product_logits, targets, anchors, captions)
+            return losses
+        else:
+        # DO inference
+            detections=self.predictor(bbox_reg, centerness, anchors, dot_product_logits,
+                                      self.backbone.tokenizer,features["language"]["tokenized"],
+                                      images.tensors,targets[0],targets[0].get("epoch",0))
+            return detections
+            
