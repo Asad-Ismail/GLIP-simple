@@ -33,6 +33,8 @@ def token_sigmoid_binary_focal_loss(pred_logits, targets, alpha, gamma, text_mas
     if text_mask is not None:
         assert (text_mask.dim() == 2)
         text_mask = (text_mask > 0).unsqueeze(1)
+        # This to enable no obj token comment below line if it is not required
+        #text_mask[...,-1]=True
         text_mask = text_mask.repeat(1, pred_logits.size(1), 1)  # copy along the image channel dimension
         pred_logits = torch.masked_select(pred_logits, text_mask)
         #nonzero_rows = torch.any(targets[...,:-1] != 0, dim=-1)
@@ -164,6 +166,17 @@ class GLIPLoss(nn.Module):
                                                                 token_labels_stacked, text_masks=text_masks,
                                                                 version="binary")
         
+
+        # For debugging
+        #non_zero_mask = torch.any(token_labels_stacked[0] != 0, dim=1)
+        #non_zero_indices = torch.where(non_zero_mask)[0]
+        #non_zero_tokens = token_labels_stacked[0][non_zero_indices]
+        #non_zero_pred = dot_product_logits[0][non_zero_indices]
+        #print(f"Token labels are ")
+        #print(non_zero_tokens[:,:10])
+        #print(f"Token Predictions are")
+        #print(non_zero_pred[:,:10].sigmoid())
+
         box_regression_flatten = box_regression_flatten[pos_inds]
         reg_targets_flatten = reg_targets_flatten[pos_inds]
         anchors_flatten = anchors_flatten[pos_inds]
@@ -176,13 +189,12 @@ class GLIPLoss(nn.Module):
                                         weight=centerness_targets) 
                                     
         centerness_loss = self.centerness_loss_func(centerness_flatten, centerness_targets)/len(centerness_targets)
-        
-        
+           
         losses = {
             "loss_cls": cls_loss* 0.0,
-            "loss_reg": reg_loss * 2.0,
+            "loss_reg": reg_loss ,
             "loss_centerness": centerness_loss,
-            "loss_dot_product_token": dot_product_token_loss
+            "loss_dot_product_token": dot_product_token_loss *2.0
         }
         
         return losses
@@ -191,10 +203,9 @@ class GLIPLoss(nn.Module):
         cls_labels = []
         reg_targets = []
         token_labels = []
-
         offset = 0
         TOPK =9  # for matching x numbers of anchors to gts
-
+    
         for im_i in range(len(targets)):
             targets_per_im = targets[im_i]
             assert targets_per_im.mode == "xyxy"
@@ -206,7 +217,6 @@ class GLIPLoss(nn.Module):
             if positive_map is not None:
                 token_per_im = positive_map[offset:offset + num_gt, :].to(anchors[0][0].bbox.device)
                 offset += num_gt
-
 
             anchors_per_im = cat_boxlist(anchors[im_i])
             # Anchor aspect ratio
@@ -289,11 +299,15 @@ class GLIPLoss(nn.Module):
             reg_targets.append(reg_targets_per_im)
 
             token_labels.append(token_labels_per_im)
-        
+
         return  cls_labels,reg_targets,token_labels
 
 
     def GIoULoss(self, pred, target, anchor, weight=None):
+        # Check if no anchors matched GT
+        if pred.numel() == 0:
+            # Return a zero loss that maintains the gradient graph
+            return pred.sum() * 0.0
         pred_boxes = self.box_coder.decode(pred.view(-1, 4), anchor.view(-1, 4))
         pred_x1 = pred_boxes[:, 0]
         pred_y1 = pred_boxes[:, 1]

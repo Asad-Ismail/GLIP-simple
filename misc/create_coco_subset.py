@@ -116,17 +116,22 @@ def create_coco_subset(input_ann_path, output_ann_path, selected_categories, max
     print(f"\nSaved subset to: {output_ann_path}")
 
 # Selected categories
+#selected_cats = [
+#    'person', 'car', 'dog', 'cat', 'chair',
+#    'bottle', 'laptop', 'pizza', 'bird', 'umbrella'
+#]
+
 selected_cats = [
-    'person', 'car', 'dog', 'cat', 'chair',
-    'bottle', 'laptop', 'pizza', 'bird', 'umbrella'
+  'dog', 'cat'
 ]
+
 
 # Create train subset
 create_coco_subset(
     '/home/asad/dev/GLIP/DATASET/coco/annotations/instances_train2017.json',
     '/home/asad/dev/GLIP/DATASET/coco/annotations/instances_train2017_subset.json',
     selected_cats,
-    max_images_per_class=200
+    max_images_per_class=500
 )
 
 # Create val subset

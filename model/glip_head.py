@@ -68,8 +68,11 @@ class GLIPHead(nn.Module):
             
             A = dot_product_proj_queries.shape[1]
             bias = dot_product_proj_tokens_bias.unsqueeze(1).repeat(1, A, 1)
+            # Clamp log scaling since it is exponciated
+            #safe_scale = torch.clamp(self.log_scale, min=-2, max=3)
             dot_product_logit = (torch.matmul(dot_product_proj_queries, dot_product_proj_tokens.transpose(-1, -2)) / self.log_scale.exp()) + bias
             
+            #dot_product_logit = torch.clamp(dot_product_logit, max=20, min=-20)
             dot_product_logit = torch.clamp(dot_product_logit, max=50000, min=-50000)
             
             dot_product_logits.append(dot_product_logit)

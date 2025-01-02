@@ -717,7 +717,6 @@ def convert_od_to_grounding_data(target, tokenizer, ind_to_class, max_query_len=
     # Normalize positive map
     normalizer = positive_map.sum(-1)[:, None] + 1e-6
     positive_map = positive_map / normalizer
-    
     # Update target with grounding information
     target.update({
         'positive_map': positive_map,
@@ -822,6 +821,8 @@ def aggregate_scores(token_probs,score_agg):
     elif score_agg == "MAX":
         # torch.max() returns (values, indices)
         return token_probs.max(-1)[0]
+    elif score_agg == "NoOBJ":
+        return token_probs[...,-1]
     else:
         raise NotImplementedError
 
@@ -963,21 +964,22 @@ class Predictor(torch.nn.Module):
         #Passing through sigmoid for dor product logits
         dot_product_logits = dot_product_logits.sigmoid()
         scores = aggregate_scores(dot_product_logits,score_agg=self.score_agg)
-        print(f"Pred scores max are {scores.max()}")
+        #print(f"Pred scores max are {scores.max()}")
         box_cls = scores
 
         box_regression = permute_and_flatten(box_regression, N, A, 4, H, W)
         box_regression = box_regression.reshape(N, -1, 4)
-
-        candidate_inds = box_cls > self.pre_nms_thresh
+        # If no obj token is enabled then it indicates no object so we want boxes which are not NoOBJ
+        if self.score_agg=="NoOBJ":
+            candidate_inds = box_cls <  0.3
+        else:
+            candidate_inds = box_cls > self.pre_nms_thresh
         pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
         pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_top_n)
 
         centerness = permute_and_flatten(centerness, N, A, 1, H, W)
         centerness = centerness.reshape(N, -1).sigmoid()
-
         # multiply the classification scores with centerness scores
-
         box_cls = box_cls * centerness
 
         results = []
@@ -995,7 +997,7 @@ class Predictor(torch.nn.Module):
                 results.append(empty_boxlist)
                 continue
             
-            print(f"✅ Level {batch_idx}: Found {len(per_candidate_inds)}/{box_cls.shape[-1]} valid boxes above threshold {self.pre_nms_thresh:.3f}")
+            print(f"✅ Level {batch_idx}: Found {per_candidate_inds.sum().item()}/{box_cls.shape[-1]} valid boxes above threshold {self.pre_nms_thresh:.3f}")
             per_box_cls = per_box_cls[per_candidate_inds]  # Shape: num_valid_boxes
             per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
 

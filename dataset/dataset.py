@@ -40,7 +40,7 @@ class COCOGLIPDataset(Dataset):
         if transforms is None:
             self.transforms = Compose([
                 #Resize((480, 560, 640, 720, 800), max_size=1333),
-                Resize((800), max_size=1333),
+                Resize((480), max_size=800),
                 ToTensor(),
                 Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])

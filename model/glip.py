@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel,BertTokenizerFast
-from torchvision.models import swin_b
+from torchvision.models import swin_b, Swin_B_Weights
 from torch.utils.checkpoint import checkpoint
 from .glip_head import GLIPHead
 from utils.anchor_generator import anchor_generator_simple
@@ -11,8 +11,7 @@ from .glip_loss import GLIPLoss
 from utils.image_list import ImageList
 from utils.box_coder import BoxCoder 
 from utils.utils import Predictor
-from utils.utils import prepare_batch,convert_od_to_grounding_data
-from utils.utils import prepare_batch,convert_od_to_grounding_data
+from dynamichead import DynamicHead
 
 class GLIPBackbone(nn.Module):
     def __init__(self, 
@@ -21,7 +20,7 @@ class GLIPBackbone(nn.Module):
         super().__init__()
         
         # Get Swin-B model without classification head
-        swin = swin_b(weights='DEFAULT')
+        swin = swin_b(weights=Swin_B_Weights.IMAGENET1K_V1)
         self.features = swin.features  
         
         channels = {
@@ -130,43 +129,64 @@ class GLIPBackbone(nn.Module):
             'sizes': sizes
         }
 
+
+
 class VLDyHead(nn.Module):
-    def __init__(self, num_convs=2, hidden_dim=256, in_channels=256):
+    def __init__(self, num_convs=2, hidden_dim=256, in_channels_dict=None):
         super().__init__()
+        self.num_convs = num_convs
         
-        # Build tower layers
-        dyhead_tower = []
-        channels = hidden_dim
-        # Do processing in this manner Fusion -> Language -> Vision
+        self.dyhead_tower = nn.ModuleList()
         
+        if in_channels_dict is None:
+            in_channels_dict = {
+                'p3': hidden_dim,
+                'p4': hidden_dim,
+                'p5': hidden_dim
+            }
+
         for i in range(num_convs):
-            # 1. Add cross-modality fusion layer
-            dyhead_tower.append(VLFuse(hidden_dim=hidden_dim))
-            
-            # 2. Add language self-attention layer
-            dyhead_tower.append(BertEncoderLayer())
-
-            # 3. Add vision path (DyConv)
-            curr_in_channels = in_channels if i == 0 else channels
-            dyhead_tower.append(
-                DyConv(
-                    in_channels=curr_in_channels,
-                    out_channels=channels
+            stage = nn.ModuleList([
+                VLFuse(hidden_dim=hidden_dim),
+                BertEncoderLayer(),
+                DynamicHead(
+                    in_channels_dict=in_channels_dict,
+                    out_channels=hidden_dim
                 )
-            )
-        
-        self.dyhead_tower = nn.Sequential(*dyhead_tower)
-
-        
-    def forward(self, features):
+            ])
+            self.dyhead_tower.append(stage)
+            
+    def forward(self, x):
         """
         Args:
-            features: dict containing
+            x: dict containing
                 - visual: List[Tensor] of FPN features
-                - lang: dict with 'hidden' and 'masks' 
+                - visual_masks: feature masks
+                - lang: dict with 'hidden' and 'masks'
         """
-        x=self.dyhead_tower(features)
-        return x
+        # Convert list to dict for DynamicHead
+        feat_names = [f'p{i+3}' for i in range(len(x["visual"]))]
+        
+        for i in range(self.num_convs):
+            vl_fuse, lang_layer, dynamic_head = self.dyhead_tower[i]
+            
+            # Pass separate arguments to VLFuse
+            x = vl_fuse(x) 
+            
+            # Update language features
+            x = lang_layer(x)
+
+            fused_vision=x["visual"]
+            
+            # Process with DynamicHead
+            v_feat_dict = {name: feat for name, feat in zip(feat_names, fused_vision)}
+            v_out_dict = dynamic_head(v_feat_dict)
+            
+            # Update for next iteration
+            visual_feats = [v_out_dict[name] for name in feat_names]
+            x["visual"]=visual_feats
+            
+        return  x
 
 class BiMultiHeadAttention(nn.Module):
     def __init__(self, v_dim=256, l_dim=768, embed_dim=256, num_heads=8, dropout=0.1):
@@ -478,32 +498,6 @@ class BertEncoderLayer(nn.Module):
         }
         
 
-class DyConv(nn.Module):
-    """Vision path with dynamic convolution"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        
-    def forward(self, x):
-        visual_feats = x["visual"]
-        visual_masks = x["visual_masks"]  
-        lang_dict = x["lang"]
-        
-        # Process each FPN level
-        processed = []
-        for feat in visual_feats:
-            out = self.relu(self.bn(self.conv(feat)))
-            processed.append(out)
-            
-        return {
-            "visual": processed,
-            "visual_masks": visual_masks,  # Pass through masks
-            "lang": lang_dict              # Pass through
-        }
-
-
 
 class GLIP(nn.Module):
     def __init__(self, hidden_dim=256, num_classes=None):
@@ -512,7 +506,6 @@ class GLIP(nn.Module):
         if num_classes is None:
             num_classes = 80  # COCO default
         
-
         self.box_coder = BoxCoder()
         self.backbone = GLIPBackbone()
         self.dyhead = VLDyHead(hidden_dim=hidden_dim)
@@ -524,8 +517,8 @@ class GLIP(nn.Module):
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        with torch.no_grad():
-            features = self.backbone(images, sizes, captions)
+        #with torch.no_grad():
+        features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
         fused_features = self.dyhead({
