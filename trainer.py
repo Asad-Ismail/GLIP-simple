@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 import numpy as np
 import os
@@ -94,32 +95,37 @@ def train_glip():
         pin_memory=True
     )
 
+
+    num_epochs = 300
+    log_interval = 50  # Print stats 
+    save_interval=50
+    val_interval = 25
+    max_val_images=200
+
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5) #weight_decay=1e-4)
-    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
-    scheduler = optim.lr_scheduler.StepLR(
-    optimizer, 
-    step_size=2000,  # Reduce LR every 200 epochs 
-    gamma=0.75       # Halve the LR
-)
-    
-    # Training loop
-    num_epochs = 10000
-    log_interval = 5  # Print stats every 100 batches
-    #val_interval = 5    # Perform validation every 5 epochs
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-6) 
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs,eta_min=1e-7)  
+    #scheduler = optim.lr_scheduler.StepLR(
+    #optimizer, 
+    #step_size=2000,
+    #gamma=0.75) 
+    #scheduler = OneCycleLR(
+    #    optimizer,
+    #    max_lr=1e-5,
+    #    epochs=num_epochs,
+    #    steps_per_epoch=len(train_loader),
+    #    pct_start=0.1  # 10% warmup
+    #)
+    # Required for mixed training
     scaler = torch.amp.GradScaler()
+
     for epoch in range(num_epochs):
-        
         total_loss = 0
         for batch_idx, batch in tqdm(enumerate(train_loader), 
                                 desc=f'Epoch {epoch}', 
                                 total=len(train_loader),
                                 position=1, 
                                 leave=False):
-            #if batch_idx>1:
-            #        break
-            #if batch_idx<1:
-            #        continue
             # Move data to device and perform a training step
             batch_loss_dict = train_step(model, batch, optimizer, device,scaler)  # train_step returns a dict
             batch_loss = sum(batch_loss_dict.values())  # Sum the losses from the dict
@@ -144,10 +150,11 @@ def train_glip():
         # Step the scheduler
         scheduler.step()
 
-        # Save checkpoint every 10 epochs
-        
-        if (epoch + 1) % 50 == 0:
-            checkpoint_path = f'weights/checkpoint_epoch_{epoch+1}.pth'
+        # Save checkpoint 
+        if epoch % save_interval == 0:
+            checkpoint_dir="weights"
+            os.makedirs(checkpoint_dir,exist_ok=True)
+            checkpoint_path = f'{checkpoint_dir}/checkpoint_epoch_{epoch+1}.pth'
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -157,13 +164,12 @@ def train_glip():
                 #'val_loss': avg_val_loss
             }, checkpoint_path)
             print(f'Checkpoint saved: {checkpoint_path}')
-
-        if epoch%50==0:
+        
+        # Do validation and visualization
+        if epoch%val_interval==0:
             for batch_idx,batch in enumerate(val_loader):
-                if batch_idx>200:
+                if batch_idx>max_val_images:
                     break
-                #if batch_idx<1:
-                #    continue
                 val_step(model, batch, device,epoch)
 
         
