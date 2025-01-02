@@ -1074,6 +1074,6 @@ class Predictor(torch.nn.Module):
                 keep = cls_scores >= image_thresh.item()
                 keep = torch.nonzero(keep).squeeze(1)
                 result = result[keep]
-            print(f"Output BBOX are {result.bbox}, with labels {result.get_field('phrases')}")
+            #print(f"Output BBOX are {result.bbox}, with labels {result.get_field('phrases')}")
             results.append(result)
         return results

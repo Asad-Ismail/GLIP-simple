@@ -176,7 +176,6 @@ class GLIPLoss(nn.Module):
         #print(non_zero_tokens[:,:10])
         #print(f"Token Predictions are")
         #print(non_zero_pred[:,:10].sigmoid())
-
         box_regression_flatten = box_regression_flatten[pos_inds]
         reg_targets_flatten = reg_targets_flatten[pos_inds]
         anchors_flatten = anchors_flatten[pos_inds]
