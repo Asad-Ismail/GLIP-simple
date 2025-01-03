@@ -437,15 +437,13 @@ class BertEncoderLayer(nn.Module):
     def __init__(self, hidden_size=768, mlp_ratio=4, dropout=0.1):
         super().__init__()
         self.hidden_size = hidden_size
-        
-        # Pre-norms (more stable than post-norm)
+
         self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
         
         # Attention
         self.attn = BertAttention(hidden_size, dropout=dropout)
-        
-        # FFN with smaller initial weights
+
         self.ffn = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * mlp_ratio),
             nn.GELU(),
