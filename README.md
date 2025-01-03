@@ -15,13 +15,7 @@ This repository provides:
 
 ## Original vs Simplified
 
-Nor
-
-```diff
-- 500+ lines of complex configuration-driven code
-+ 150 lines of clean, focused implementation
-```
-
+Below table shows comparison of original and this implemntation.
 
 | Feature | Original | Simplified |
 |---------|----------|------------|
@@ -31,7 +25,8 @@ Nor
 | Core Functionality | ✅ | ✅ |
 | V+L Fusion | ✅ | ✅ |
 | Token Projection | ✅ | ✅ |
-| Extra Features* | ✅ | ❌ |
+| Extra Features | ✅ | ❌ |
+| Multi GPU training | ✅ | ❌ (not yet) |
 
 Lines is provided solely to illustrate relative complexity rather than anything serious.
 
