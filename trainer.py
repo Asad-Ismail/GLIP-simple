@@ -105,17 +105,6 @@ def train_glip():
     # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-6) 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs,eta_min=1e-7)  
-    #scheduler = optim.lr_scheduler.StepLR(
-    #optimizer, 
-    #step_size=2000,
-    #gamma=0.75) 
-    #scheduler = OneCycleLR(
-    #    optimizer,
-    #    max_lr=1e-5,
-    #    epochs=num_epochs,
-    #    steps_per_epoch=len(train_loader),
-    #    pct_start=0.1  # 10% warmup
-    #)
     # Required for mixed training
     scaler = torch.amp.GradScaler()
 

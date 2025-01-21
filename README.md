@@ -25,7 +25,6 @@ Below table shows comparison of original and this implemntation.
 | Core Functionality | ✅ | ✅ |
 | V+L Fusion | ✅ | ✅ |
 | Token Projection | ✅ | ✅ |
-| Extra Features | ✅ | ❌ |
 | Multi GPU training | ✅ | ❌ (not yet) |
 
 Lines is provided solely to illustrate relative complexity rather than anything serious.

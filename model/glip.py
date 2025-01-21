@@ -515,7 +515,6 @@ class GLIP(nn.Module):
     def forward(self, images, sizes, captions,targets=None):
         """Forward pass without loss computation"""
         # Get backbone features
-        #with torch.no_grad():
         features = self.backbone(images, sizes, captions)
         
         # Process through dynamic head
