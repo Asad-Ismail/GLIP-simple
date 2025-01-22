@@ -42,6 +42,20 @@ python trainer.py
 ```
 
 
+## Qualitative Results
+
+<div align="center">
+  <img src="vis/epoch_0_1.jpg" alt="Intial Detections" width="45%">
+  <img src="vis/epoch_30_1.jpg" alt="After 30 Epochs" width="45%">
+</div>
+
+
+<div align="center">
+  <img src="vis/epoch_0_2.jpg" alt="Intial Detections" width="45%">
+  <img src="vis/epoch_30_2.jpg" alt="After 30 Epochs" width="45%">
+</div>
+
+
 
 ## 📖 References
 
