@@ -44,6 +44,8 @@ python trainer.py
 
 ## Qualitative Results
 
+Left, when the model just start training it produces mostly random boxes, right prediction results after 30 epochs.
+
 <div align="center">
   <img src="vis/epoch_0_1.jpg" alt="Intial Detections" width="45%">
   <img src="vis/epoch_30_1.jpg" alt="After 30 Epochs" width="45%">
